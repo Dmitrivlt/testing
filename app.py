@@ -1374,7 +1374,7 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
       </div>
       <div>
         <label class="title">Mid filter</label><br/>
-        <div id="mid" class="switch"><input type="checkbox"/><div class="thumb"></div></div>
+        <div id="mid" class="switch on"><input type="checkbox"/><div class="thumb"></div></div>
       </div>
       <div>
         <label class="title">Signal: Close-only</label><br/>
