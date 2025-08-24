@@ -1337,7 +1337,7 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
 /* iOS-style switches */
 .switch { position:relative; width:54px; height:30px; background:#374151; border-radius:999px; transition:background .2s ease; border:1px solid #4b5563; cursor:pointer; }
 .switch input { display:none; }
-.switch .thumb { position:absolute; top:3px; left:3px; width:24px; height:24px; background:#fff; border-radius:50%; transition:left .2s ease; box-shadow: 0 2px 8px rgba(0,0,0,.35); }
+.switch .thumb { position:absolute; top:2px; left:3px; width:24px; height:24px; background:#fff; border-radius:50%; transition:left .2s ease; box-shadow: 0 2px 8px rgba(0,0,0,.35); }
 .switch.on { background:#16a34a; border-color:#16a34a; }
 .switch.on .thumb { left:27px; }
 
@@ -1363,7 +1363,7 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
       </div>
       <div>
         <label class="title">Leverage</label><br/>
-        <input id="lev" type="number" value="10" min="1" max="50" step="1"/>
+        <input id="lev" type="number" value="1" min="1" max="50" step="1"/>
       </div>
       <div>
         <label class="title">Mode</label><br/>
