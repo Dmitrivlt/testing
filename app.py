@@ -1381,7 +1381,7 @@ TF_OPTIONS = "".join([f"<option{' selected' if tf==DEFAULT_INTERVAL else ''}>{tf
 
 HTML_TEMPLATE = """
 <!doctype html><html><head><meta charset="utf-8"/>
-<title>EMA Cross + Trail — Binance Futures</title>
+<title>EMA Touch — Binance Futures</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
 :root { --bg:#0f172a; --card:#111827; --muted:#94a3b8; --text:#e5e7eb; --border:#1f2937; --green:#22c55e; --red:#ef4444; --blue:#3b82f6; --amber:#f59e0b; --gray:#6b7280; }
@@ -1408,13 +1408,53 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
 .waiting { background:#1f2937; color:#cbd5e1; }
 .long { background:rgba(34,197,94,.2); color:#86efac; }
 .short { background:rgba(239,68,68,.2); color:#fca5a5; }
+/* iOS-style switches */
+.switch { position:relative; width:54px; height:30px; background:#374151; border-radius:999px; transition:background .2s ease; border:1px solid #4b5563; cursor:pointer; }
+.switch input { display:none; }
+.switch .thumb { position:absolute; top:3px; left:3px; width:24px; height:24px; background:#fff; border-radius:50%; transition:left .2s ease; box-shadow: 0 2px 8px rgba(0,0,0,.35); }
+.switch.on { background:#16a34a; border-color:#16a34a; }
+.switch.on .thumb { left:27px; }
+.grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap:12px; }
 .small { color:var(--muted); font-size:12px; }
+.kpi { display:flex; gap:8px; align-items:center; }
+.kpi b { font-size:16px; }
 </style>
 </head>
 <body>
 <div class="container">
-<h2>EMA Cross + Trailing 0.1% — Binance Futures</h2>
+<h2>EMA Touch — Binance Futures</h2>
 <div class="card">
+  <div class="grid">
+    <div>
+      <label class="title">Symbols (comma)</label><br/>
+      <input id="sym" type="text" value="" placeholder="choose a coin"/>
+      <div class="small">Оставь пустым — бот выберет Топ-1 24h % автоматически (USDT-M PERP). Фолбэк: CYBERUSDT.</div>
+    </div>
+    <div>
+      <label class="title">Timeframe</label><br/>
+      <select id="tf">%%TF_OPTIONS%%</select>
+    </div>
+    <div>
+      <label class="title">Leverage</label><br/>
+      <input id="lev" type="number" value="10" min="1" max="50" step="1"/>
+    </div>
+    <div>
+      <label class="title">Mode</label><br/>
+      <select id="mode">
+        <option selected>Both</option>
+        <option>Long only</option>
+      </select>
+    </div>
+    <div>
+      <label class="title">Mid filter</label><br/>
+      <div id="mid" class="switch"><input type="checkbox"/><div class="thumb"></div></div>
+    </div>
+    <div>
+      <label class="title">Signal: Close-only</label><br/>
+      <div id="closeonly" class="switch"><input type="checkbox"/><div class="thumb"></div></div>
+      <div class="small">OFF = Touch (intrabar)</div>
+    </div>
+  </div>
   <div class="row" style="margin-top:12px;">
     <button id="btnStart" class="primary" onclick="start()">Start</button>
     <button class="danger" onclick="stop()">Stop</button>
@@ -1429,22 +1469,45 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
   <table class="table">
     <thead>
       <tr>
-        <th>Symbol</th><th>TF</th><th>Source</th><th>Lev</th><th>Mode</th><th>Close-only</th><th>Signal</th><th>Bot</th>
+        <!-- Убраны Source и Signal -->
+        <th>Symbol</th><th>TF</th><th>Lev</th><th>Mode</th><th>Mid</th><th>Bot</th>
         <th>Avail USDT</th><th>Pos</th><th>Entry</th>
         <th>EMA50</th><th>EMA100</th><th>EMA200</th>
         <th>PnL Today (R)</th><th>Last Action</th><th>Error</th>
-        <th>TrailRate</th><th>LongPeak</th><th>ShortTrough</th>
       </tr>
     </thead>
     <tbody id="tbody"></tbody>
   </table>
   <div class="small" style="margin-top:8px;">
-    Реализованный PnL считается за календарные сутки UTC. Трейлинг по умолчанию 0.1% (env: TRAIL_RATE).
+    Реализованный PnL считается за календарные сутки UTC. Положительный — зелёный, отрицательный — красный.
   </div>
 </div>
 </div>
 
 <script>
+function toggleInit(id){
+  const el=document.getElementById(id);
+  el.addEventListener('click', ()=>{ el.classList.toggle('on'); });
+  return el;
+}
+const mid = toggleInit('mid');
+const closeonly = toggleInit('closeonly');
+
+function symbols(){
+  return document.getElementById('sym').value
+    .split(',')
+    .map(s=>s.trim())
+    .filter(Boolean); // если пусто — [] => авто-пик на сервере
+}
+function params(){
+  return {
+    interval: document.getElementById('tf').value,
+    leverage: parseInt(document.getElementById('lev').value),
+    mid_filter: mid.classList.contains('on'),
+    on_close_only: closeonly.classList.contains('on'),
+    mode: document.getElementById('mode').value
+  };
+}
 async function post(path, body){
   const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
   if(!r.ok){
@@ -1460,58 +1523,83 @@ async function get(path){
   return r.json();
 }
 async function start(){
-  try{
-    await post('/api/start',{symbols:[], interval:'1m', leverage:10, mid_filter:false, on_close_only:false, mode:'Both'});
-    await refresh();
-  }catch(e){ alert('Start: '+e.message); }
+  try{ const p=params(); await post('/api/start',{symbols:symbols(), ...p}); await refresh(); }
+  catch(e){ alert('Start: '+e.message); }
 }
 async function stop(){
   try{ await post('/api/stop',{}); await refresh(); }
   catch(e){ alert('Stop: '+e.message); }
 }
 async function restart(){
-  try{
-    await post('/api/restart',{symbols:[], interval:'1m', leverage:10, mid_filter:false, on_close_only:false, mode:'Both'});
-    await refresh();
-  }catch(e){ alert('Restart: '+e.message); }
+  try{ const p=params(); await post('/api/restart',{symbols:symbols(), ...p}); await refresh(); }
+  catch(e){ alert('Restart: '+e.message); }
 }
+
 function td(v){
   const d=document.createElement('td');
   if(v==null) v='';
-  if(typeof v==='number'){ d.textContent = Math.abs(v) >= 0.0001 ? v.toFixed(6) : v.toString(); }
-  else { d.textContent = v; }
+  if(typeof v==='number'){
+    // Общее форматирование чисел: 6 знаков для цен/EMA/PNL,
+    // но для маленьких чисел оставляем как есть
+    d.textContent = Math.abs(v) >= 0.0001 ? v.toFixed(6) : v.toString();
+  } else {
+    d.textContent = v;
+  }
   return d;
 }
+
+// Спец-ячейка для Leverage — всегда целое число
+function tdLev(v){
+  const d=document.createElement('td');
+  const n = parseInt(v, 10);
+  d.textContent = isNaN(n) ? (v ?? "") : String(n);
+  return d;
+}
+
 function stateBadge(state){
   const span=document.createElement('span');
   span.className='status-badge';
-  span.textContent = state || 'Waiting';
+  if(state==='LONG'){ span.classList.add('long'); span.textContent='LONG'; }
+  else if(state==='SHORT'){ span.classList.add('short'); span.textContent='SHORT'; }
+  else { span.classList.add('waiting'); span.textContent=state || 'Waiting'; }
   return span;
 }
+
+function pnlCell(v){
+  const tdEl=document.createElement('td');
+  const b=document.createElement('span');
+  b.className='status-badge';
+  let num = (typeof v==='number') ? v : parseFloat(v||0) || 0;
+  b.textContent = Math.abs(num) >= 0.0001 ? num.toFixed(6) : num.toString();
+  if(num > 0) b.classList.add('long');
+  else if(num < 0) b.classList.add('short');
+  else b.classList.add('waiting');
+  tdEl.appendChild(b);
+  return tdEl;
+}
+
 function pushRow(tb, w){
   const tr=document.createElement('tr');
   tr.appendChild(td(w.symbol));
   tr.appendChild(td(w.interval));
-  tr.appendChild(td(w.source||''));
-  tr.appendChild(td(w.leverage));
+  tr.appendChild(tdLev(w.leverage));          // <-- целое число для Lev
   tr.appendChild(td(w.mode||'-'));
-  tr.appendChild(td(w.onCloseOnly?'ON':'OFF'));
-  tr.appendChild(td(w.lastSignal||''));
-  const stateCell = document.createElement('td'); stateCell.appendChild(stateBadge(w.botState)); tr.appendChild(stateCell);
+  tr.appendChild(td(w.midFilter?'ON':'OFF'));
+  const stateCell = document.createElement('td');
+  stateCell.appendChild(stateBadge(w.botState));
+  tr.appendChild(stateCell);
   tr.appendChild(td(w.availableUSDT));
   tr.appendChild(td(w.netPos));
   tr.appendChild(td(w.entryPx));
   tr.appendChild(td(w.ema50));
   tr.appendChild(td(w.ema100));
   tr.appendChild(td(w.ema200));
-  tr.appendChild(td(w.pnlToday));
+  tr.appendChild(pnlCell(w.pnlToday));
   tr.appendChild(td(w.lastAction||''));
   tr.appendChild(td(w.lastError||''));
-  tr.appendChild(td(w.trailRate));
-  tr.appendChild(td(w.trailLongPeak));
-  tr.appendChild(td(w.trailShortTrough));
   tb.appendChild(tr);
 }
+
 async function refresh(){
   const st=await get('/api/status');
   const flag=document.getElementById('flag');
@@ -1533,6 +1621,7 @@ async function loop(){
   }
 }
 window.addEventListener('load', loop);
+window.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ document.getElementById('btnStart').click(); } });
 </script>
 </body></html>
 """
