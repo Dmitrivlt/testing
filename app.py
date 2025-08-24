@@ -19,22 +19,19 @@ TIME_SYNC_SEC = 300
 
 # ---------- Strategy / risk defaults ----------
 DEFAULT_INTERVAL = "1m"
-DEFAULT_LEVERAGE = 1  # по умолчанию 10х
+DEFAULT_LEVERAGE = 1
 LEVERAGE_CAP = 50
 UTILIZATION = 1.00
 FEE_BUFFER_RATE = 0.001
 WARMUP_LIMIT = 1200
 
-MID_GAP_THRESHOLD = float(os.getenv("MID_GAP_THRESHOLD", "0.01"))  # 1% (не используется в кросс-логике)
-DEFAULT_ON_CLOSE_ONLY = False  # True => сигналы только на закрытии бара
-DEFAULT_MODE = "BOTH"  # BOTH | LONG
-AUTO_FALLBACK_SYMBOL = "CYBERUSDT"  # если авто-пик не удался
+# ВНИМАНИЕ: по умолчанию — подтверждение на закрытии бара (как в Pine)
+DEFAULT_ON_CLOSE_ONLY = True
 
-# Источник цены для EMA: close | hl2 | hlc3 | ohlc4
-EMA_PRICE_SRC = os.getenv("EMA_PRICE_SRC", "close").lower()
-
-# >>> TRAIL
-TRAIL_RATE = float(os.getenv("TRAIL_RATE", "0.001"))  # 0.1% по умолчанию
+# Эти поля оставлены для совместимости интерфейса/менеджера, но в сигнале не используются
+MID_GAP_THRESHOLD = float(os.getenv("MID_GAP_THRESHOLD", "0.01"))
+DEFAULT_MODE = "BOTH"
+AUTO_FALLBACK_SYMBOL = "CYBERUSDT"
 
 NATIVE_INTERVALS = {"1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d","3d","1w","1M"}
 ALL_INTERVALS = ["1s"] + sorted(
@@ -45,29 +42,14 @@ ALL_INTERVALS = ["1s"] + sorted(
 def now_ms() -> int:
     return int(time.time()*1000)
 
-# ---------- Helpers: price source ----------
-def _price_from_ohlc(o: float, h: float, l: float, c: float) -> float:
-    s = EMA_PRICE_SRC
-    if s == "hl2":
-        return (h + l) / 2.0
-    if s == "hlc3":
-        return (h + l + c) / 3.0
-    if s == "ohlc4":
-        return (o + h + l + c) / 4.0
-    return c  # close (default)
+# ---------- Helpers: price (только CLOSE) ----------
+def _kline_row_close(row: list) -> float:
+    # [0 openTime, 1 open, 2 high, 3 low, 4 close, ...]
+    return float(row[4])
 
-def _kline_row_price(row: list) -> float:
-    # Binance kline array: [0 openTime, 1 open, 2 high, 3 low, 4 close, 5 volume, ...]
-    o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4])
-    return _price_from_ohlc(o, h, l, c)
-
-def _kline_tick_price(k: dict) -> float:
-    # WS "k" payload has string fields o,h,l,c
-    try:
-        o = float(k.get("o", 0)); h = float(k.get("h", 0)); l = float(k.get("l", 0)); c = float(k.get("c", 0))
-    except Exception:
-        c = float(k.get("c", 0.0)); o = h = l = c
-    return _price_from_ohlc(o, h, l, c)
+def _kline_tick_close(k: dict) -> float:
+    # WS "k" payload has string fields, берём только close
+    return float(k.get("c", 0.0))
 
 # ---------- Backoff helpers ----------
 async def _get_with_backoff(http: httpx.AsyncClient, url: str, *, params: Optional[dict]=None, headers: Optional[dict]=None, max_tries: int=6) -> httpx.Response:
@@ -119,19 +101,11 @@ async def _signed_get_with_backoff(http: httpx.AsyncClient, url: str, *, params:
                 r.raise_for_status()
             return r
 
-# ---------- EMA (TV-style: seed = SMA(N)) ----------
+# ---------- EMA (как в TradingView: seed = SMA(N), alpha=2/(N+1)) ----------
 def tv_ema_series(closes: List[float], length: int) -> List[Optional[float]]:
-    """
-    EMA с инициализацией SMA(N) (как в классическом TV):
-    - пока баров < N -> None
-    - на индексе N-1 seed = SMA(N)
-    - дальше: EMA_t = alpha*close_t + (1-alpha)*EMA_{t-1}, alpha=2/(N+1)
-    """
     n = len(closes)
     out: List[Optional[float]] = [None] * n
-    if length < 1 or n == 0:
-        return out
-    if n < length:
+    if length < 1 or n == 0 or n < length:
         return out
     alpha = 2.0 / (length + 1.0)
     seed = sum(float(x) for x in closes[:length]) / float(length)
@@ -161,7 +135,7 @@ class FuturesClient:
         # account
         self.available_usdt: float = 0.0
         self.leverage: int = DEFAULT_LEVERAGE
-        self.dual_side: bool = False  # Hedge mode?
+        self.dual_side: bool = False
         # one-way net position (BOTH)
         self.net_pos: float = 0.0
         self.entry_px: float = 0.0
@@ -300,12 +274,10 @@ class FuturesClient:
         return float(f"{q:.{prec}f}")
 
     def min_qty_for_notional(self, price: float) -> float:
-        """Минимум, чтобы удовлетворить и minNotional, и minQty."""
         need_by_notional = self._round_qty_ceil(self.min_notional / max(price, 1e-12))
         return max(self.min_qty, need_by_notional)
 
     def max_affordable_qty(self, price: float) -> float:
-        """Максимум, исходя из доступного нотионала (учитываем буфер)."""
         notional_cap = max(0.0, self.available_usdt - self.available_usdt*FEE_BUFFER_RATE) * self.leverage * UTILIZATION
         q = self._round_qty_floor(notional_cap / max(price, 1e-12))
         if self.max_qty > 0:
@@ -329,10 +301,6 @@ class FuturesClient:
             return None
 
     async def place_market(self, side: str, qty: float, *, reduce_only: bool=False, position_side: Optional[str]=None) -> Tuple[Optional[int], Optional[str]]:
-        """
-        Универсальный маркет-ордер.
-        ВНИМАНИЕ: в hedge-режиме reduceOnly НЕ отправляем (иначе -1106).
-        """
         ts = now_ms() + TIME_DRIFT_MS
         params = {
             "symbol": self.symbol,
@@ -377,12 +345,6 @@ class FuturesClient:
         qty_override: Optional[float] = None,
         open_prefer_qty: Optional[float] = None
     ) -> Tuple[Optional[int], Optional[str]]:
-        """
-        Маркет с ретраями.
-        - Для reduce_only берём фактический размер позиции (или qty_override).
-        - Для открытия сначала пробуем open_prefer_qty (например, размер только что закрытой позиции),
-          если не проходит — уменьшаем ступенями, потом fallback к compute_order_qty().
-        """
         price = ref_price if ref_price > 0 else (await self.fetch_last_price() or 0.0)
         await self.fetch_account()
         before_net = self.net_pos
@@ -486,32 +448,29 @@ class SecAggregator:
         self.sec = s; self.o=self.h=self.l=self.c=price; self.v=qty
         return closed
 
-# ---------- EMA Cross Runner (ONLY cross 50/200) ----------
+# ---------- EMA Cross Runner (как в Pine) ----------
 class EMARunner:
     def __init__(self, symbol: str, interval: str, leverage: int, mid_filter: bool, mode: str, on_close_only: bool, http: httpx.AsyncClient):
         self.symbol = symbol.upper()
         self.interval = interval
         self.target_leverage = max(1, min(leverage, LEVERAGE_CAP))
-        self.mid_filter = bool(mid_filter)  # НЕ используется в кросс-логике
-        self.mode = "LONG" if str(mode).upper().startswith("LONG") else "BOTH"
+        self.mid_filter = bool(mid_filter)  # оставлено, но не используется в сигнале
+        self.mode = "BOTH"  # режим не используется для сигналов кросса (как в Pine)
         self.on_close_only = bool(on_close_only)
         self.http = http
 
         self.c = FuturesClient(self.symbol, http)
 
         self.closes: List[float] = []
-        self.ema50: Optional[float] = None      # последние ЗАКРЫТЫЕ EMA
-        self.ema100: Optional[float] = None
+        self.ema50: Optional[float] = None    # значения EMA на ЗАКРЫТОМ баре
+        self.ema100: Optional[float] = None   # не участвует в логике, оставлено для UI
         self.ema200: Optional[float] = None
 
-        # prev закрытые EMA (бар назад)
-        self.prev_ema50_closed: Optional[float] = None
-        self.prev_ema200_closed: Optional[float] = None
-
-        # >>> TRAIL: состояние трейлинга
-        self.trail_rate: float = TRAIL_RATE
-        self.long_peak: Optional[float] = None     # максимум после входа в LONG
-        self.short_trough: Optional[float] = None  # минимум после входа в SHORT
+        # для интрабар-калькуляции EMA (используем last_closed_ema как prev)
+        self.alpha50 = 2.0/(50.0+1.0)
+        self.alpha200 = 2.0/(200.0+1.0)
+        self.prev_tick_ema50: Optional[float] = None
+        self.prev_tick_ema200: Optional[float] = None
 
         self.running = False
         self._tasks: List[asyncio.Task] = []
@@ -521,10 +480,10 @@ class EMARunner:
         self.last_action: Optional[str] = None
         self.last_action_ts: Optional[int] = None
         self.last_error: Optional[str] = None
-        self.source: str = "kline"  # "kline" | "aggTrade_1s"
-        self.bot_state: str = "Waiting"  # Waiting / LONG / SHORT
+        self.source: str = "kline"
+        self.bot_state: str = "Waiting"
 
-        # защита от дублей сигнала внутри одного бара
+        # одно событие на бар
         self.last_bar_key: Optional[str] = None
         self.fired_cross_this_bar: bool = False
 
@@ -539,7 +498,7 @@ class EMARunner:
                 params={"symbol": self.symbol, "interval": self.interval, "limit": WARMUP_LIMIT}
             )
             data = r.json()
-            closes = [_kline_row_price(x) for x in data]
+            closes = [_kline_row_close(x) for x in data]  # ТОЛЬКО close
             if not closes:
                 return
             self.closes = closes
@@ -549,9 +508,6 @@ class EMARunner:
             self.ema50  = e50[-1]
             self.ema100 = e100[-1]
             self.ema200 = e200[-1]
-            if len(e50) >= 2 and e50[-2] is not None and e200[-2] is not None:
-                self.prev_ema50_closed = e50[-2]
-                self.prev_ema200_closed = e200[-2]
         except Exception as e:
             self.last_error = f"warmup_native: {e}"
 
@@ -587,18 +543,13 @@ class EMARunner:
         self.ema50  = e50[-1]
         self.ema100 = e100[-1]
         self.ema200 = e200[-1]
-        if len(e50) >= 2 and e50[-2] is not None and e200[-2] is not None:
-            self.prev_ema50_closed = e50[-2]
-            self.prev_ema200_closed = e200[-2]
 
-    # ---------- Update EMA on bar close ----------
+    # ---------- Обновление EMA на закрытии бара ----------
     async def _on_bar_close(self, close_price: float, bar_key: str):
+        # обновляем закрытые EMA
         self.closes.append(close_price)
         if len(self.closes) > WARMUP_LIMIT:
             self.closes = self.closes[-WARMUP_LIMIT:]
-
-        prev50 = self.ema50
-        prev200 = self.ema200
 
         if self.ema50 is None:
             self.ema50 = tv_ema_series(self.closes, 50)[-1]
@@ -615,123 +566,40 @@ class EMARunner:
         else:
             self.ema200 = tv_ema_next(self.ema200, close_price, 200)
 
-        if prev50 is not None and prev200 is not None:
-            self.prev_ema50_closed = prev50
-            self.prev_ema200_closed = prev200
-
         self.last_bar_key = bar_key
-        self.fired_cross_this_bar = False  # новый бар => можно снова дать интрабар-сигнал
+        self.fired_cross_this_bar = False
+        # сбрасываем интрабарные EMA (новый бар = новая «эфемерная» EMA)
+        self.prev_tick_ema50 = None
+        self.prev_tick_ema200 = None
 
-    # ---------- Cross-only signals ----------
-    def _signal_on_close_cross(self) -> Optional[str]:
-        if self.prev_ema50_closed is None or self.prev_ema200_closed is None or self.ema50 is None or self.ema200 is None:
-            return None
-        d_prev = self.prev_ema50_closed - self.prev_ema200_closed
-        d_curr = self.ema50 - self.ema200
-        if d_prev <= 0 and d_curr > 0:
-            return "LONG"
-        if d_prev >= 0 and d_curr < 0:
-            return "SHORT"
-        return None
-
-    def _signal_intrabar_cross(self, tick_price: float, bar_key: Optional[str]) -> Optional[str]:
+    # ---------- Интрабар кросс EMA↔EMA (как в Pine при confirmOff) ----------
+    def _intrabar_cross_signal(self, price: float, bar_key: str) -> Optional[str]:
         if self.ema50 is None or self.ema200 is None:
             return None
-        same_bar = (bar_key is not None and bar_key == self.last_bar_key)
-        if same_bar and self.fired_cross_this_bar:
+
+        # ephemeral EMA на текущем тике: prev = закрытая EMA предыдущего бара
+        ema50_now = self.alpha50*price + (1.0 - self.alpha50)*self.ema50
+        ema200_now = self.alpha200*price + (1.0 - self.alpha200)*self.ema200
+
+        # первый тик бара — запоминаем и выходим
+        if self.prev_tick_ema50 is None or self.prev_tick_ema200 is None:
+            self.prev_tick_ema50 = ema50_now
+            self.prev_tick_ema200 = ema200_now
             return None
 
-        live50  = tv_ema_next(self.ema50,  tick_price, 50)
-        live200 = tv_ema_next(self.ema200, tick_price, 200)
+        # та же логика, что у crossover/crossunder: сравниваем «до» и «после»
+        long_cross  = (self.prev_tick_ema50 <= self.prev_tick_ema200) and (ema50_now > ema200_now)
+        short_cross = (self.prev_tick_ema50 >= self.prev_tick_ema200) and (ema50_now < ema200_now)
 
-        sig: Optional[str] = None
-        if self.ema50 <= self.ema200 and live50 > live200:
-            sig = "LONG"
-        elif self.ema50 >= self.ema200 and live50 < live200:
-            sig = "SHORT"
+        # обновляем «предыдущие» на следующий тик
+        self.prev_tick_ema50 = ema50_now
+        self.prev_tick_ema200 = ema200_now
 
-        if sig and same_bar:
-            self.fired_cross_this_bar = True
-
-        return sig
-
-    # ---------- TRAIL ----------
-    async def _maybe_trail_exit(self, price: float):
-        """
-        Проверяем трейлинг-стоп и при необходимости закрываем позицию market reduce-only.
-        Логика не влияет на генерацию сигналов — только выход.
-        """
-        try:
-            minq = max(self.c.min_qty, 0.0)
-
-            if self.c.dual_side:
-                # --- LONG side ---
-                if self.c.long_pos > minq:
-                    # обновляем пик
-                    self.long_peak = price if self.long_peak is None else max(self.long_peak, price)
-                    if self.long_peak and price <= self.long_peak * (1.0 - self.trail_rate):
-                        q = self.c._round_qty_floor(self.c.long_pos)
-                        _, err = await self.c.place_market_smart(
-                            "SELL", price, reduce_only=True, position_side="LONG", qty_override=q
-                        )
-                        await self.c.fetch_account()
-                        ok = (err is None and self.c.long_pos <= 1e-12)
-                        self.last_action = "TRAIL EXIT LONG ok" if ok else f"TRAIL EXIT LONG FAILED ({err})"
-                        self.last_action_ts = now_ms()
-                        if ok:
-                            self.long_peak = None
-                else:
-                    self.long_peak = None
-
-                # --- SHORT side ---
-                if self.c.short_pos > minq:
-                    self.short_trough = price if self.short_trough is None else min(self.short_trough, price)
-                    if self.short_trough and price >= self.short_trough * (1.0 + self.trail_rate):
-                        q = self.c._round_qty_floor(self.c.short_pos)
-                        _, err = await self.c.place_market_smart(
-                            "BUY", price, reduce_only=True, position_side="SHORT", qty_override=q
-                        )
-                        await self.c.fetch_account()
-                        ok = (err is None and self.c.short_pos <= 1e-12)
-                        self.last_action = "TRAIL EXIT SHORT ok" if ok else f"TRAIL EXIT SHORT FAILED ({err})"
-                        self.last_action_ts = now_ms()
-                        if ok:
-                            self.short_trough = None
-                else:
-                    self.short_trough = None
-
-            else:
-                pos = self.c.net_pos
-                if pos > minq:
-                    self.long_peak = price if self.long_peak is None else max(self.long_peak, price)
-                    if self.long_peak and price <= self.long_peak * (1.0 - self.trail_rate):
-                        q = self.c._round_qty_floor(abs(pos))
-                        _, err = await self.c.place_market_smart("SELL", price, reduce_only=True, qty_override=q)
-                        await self.c.fetch_account()
-                        ok = (err is None and self.c.net_pos <= 1e-12)
-                        self.last_action = "TRAIL EXIT LONG ok" if ok else f"TRAIL EXIT LONG FAILED ({err})"
-                        self.last_action_ts = now_ms()
-                        if ok:
-                            self.long_peak = None
-                            self.short_trough = None
-                elif pos < -minq:
-                    self.short_trough = price if self.short_trough is None else min(self.short_trough, price)
-                    if self.short_trough and price >= self.short_trough * (1.0 + self.trail_rate):
-                        q = self.c._round_qty_floor(abs(pos))
-                        _, err = await self.c.place_market_smart("BUY", price, reduce_only=True, qty_override=q)
-                        await self.c.fetch_account()
-                        ok = (err is None and self.c.net_pos >= -1e-12 and self.c.net_pos <= 1e-12)
-                        self.last_action = "TRAIL EXIT SHORT ok" if ok else f"TRAIL EXIT SHORT FAILED ({err})"
-                        self.last_action_ts = now_ms()
-                        if ok:
-                            self.short_trough = None
-                            self.long_peak = None
-                else:
-                    self.long_peak = None
-                    self.short_trough = None
-
-        except Exception as e:
-            self.last_error = f"trail: {e}"
+        if long_cross:
+            return "LONG"
+        if short_cross:
+            return "SHORT"
+        return None
 
     # ---------- Локальный статус ----------
     def _refresh_state_nowait(self):
@@ -750,7 +618,7 @@ class EMARunner:
         except Exception:
             self.bot_state = "Waiting"
 
-    # ---------- ДЕЙСТВИЯ ПО СИГНАЛУ (flip-логика) ----------
+    # ---------- ДЕЙСТВИЯ ПО СИГНАЛУ (flip) ----------
     async def _act_on_signal(self, sig: Optional[str], ref_price: float):
         try:
             await self.c.fetch_account()
@@ -759,142 +627,58 @@ class EMARunner:
 
             if self.c.dual_side:
                 if sig == "LONG":
-                    if self.c.long_pos > min_qty:
-                        self.last_action = "HOLD: already LONG"; self.last_action_ts = now_ms()
-                        self._refresh_state_nowait()
-                    else:
-                        closed_qty = 0.0
-                        if self.c.short_pos > min_qty:
-                            q = self.c._round_qty_floor(self.c.short_pos)
-                            _, err = await self.c.place_market_smart(
-                                "BUY", ref_price, reduce_only=True, position_side="SHORT", qty_override=q
-                            )
-                            await self.c.fetch_account()
-                            if err:
-                                self.last_action = f"EXIT SHORT FAILED ({err})"; self.last_action_ts = now_ms(); return
-                            self.last_action = "EXIT SHORT ok"; self.last_action_ts = now_ms()
-                            closed_qty = q
-                        await asyncio.sleep(0.25)
+                    if self.c.short_pos > min_qty:
+                        q = self.c._round_qty_floor(self.c.short_pos)
+                        _, err = await self.c.place_market_smart("BUY", ref_price, reduce_only=True, position_side="SHORT", qty_override=q)
                         await self.c.fetch_account()
-                        _, err = await self.c.place_market_smart(
-                            "BUY", ref_price, reduce_only=False, position_side="LONG",
-                            open_prefer_qty=(closed_qty if closed_qty>0 else None)
-                        )
-                        await self.c.fetch_account()
-                        ok = (err is None and self.c.long_pos > min_qty)
-                        self.last_action = "ENTER LONG ok" if ok else f"ENTER LONG FAILED ({err})"
-                        self.last_action_ts = now_ms()
-                        if ok:  # >>> TRAIL
-                            self.long_peak = ref_price
+                        if err: self.last_action = f"EXIT SHORT FAILED ({err})"; self.last_action_ts = now_ms(); return
+                    await asyncio.sleep(0.25)
+                    await self.c.fetch_account()
+                    _, err = await self.c.place_market_smart("BUY", ref_price, reduce_only=False, position_side="LONG")
+                    await self.c.fetch_account()
+                    self.last_action = "ENTER LONG ok" if err is None and self.c.long_pos > min_qty else f"ENTER LONG FAILED ({err})"
+                    self.last_action_ts = now_ms()
 
                 elif sig == "SHORT":
-                    if self.c.short_pos > min_qty:
-                        self.last_action = "HOLD: already SHORT"; self.last_action_ts = now_ms()
-                        self._refresh_state_nowait()
-                    else:
-                        closed_qty = 0.0
-                        if self.c.long_pos > min_qty:
-                            q = self.c._round_qty_floor(self.c.long_pos)
-                            _, err = await self.c.place_market_smart(
-                                "SELL", ref_price, reduce_only=True, position_side="LONG", qty_override=q
-                            )
-                            await self.c.fetch_account()
-                            if err:
-                                self.last_action = f"EXIT LONG FAILED ({err})"; self.last_action_ts = now_ms(); return
-                            self.last_action = "EXIT LONG ok"; self.last_action_ts = now_ms()
-                            closed_qty = q
-                        await asyncio.sleep(0.25)
-                        await self.c.fetch_account()
-                        _, err = await self.c.place_market_smart(
-                            "SELL", ref_price, reduce_only=False, position_side="SHORT",
-                            open_prefer_qty=(closed_qty if closed_qty>0 else None)
-                        )
-                        await self.c.fetch_account()
-                        ok = (err is None and self.c.short_pos > min_qty)
-                        self.last_action = "ENTER SHORT ok" if ok else f"ENTER SHORT FAILED ({err})"
-                        self.last_action_ts = now_ms()
-                        if ok:  # >>> TRAIL
-                            self.short_trough = ref_price
-
-                elif sig == "SHORT_EXIT_ONLY":
                     if self.c.long_pos > min_qty:
                         q = self.c._round_qty_floor(self.c.long_pos)
-                        _, err = await self.c.place_market_smart(
-                            "SELL", ref_price, reduce_only=True, position_side="LONG", qty_override=q
-                        )
+                        _, err = await self.c.place_market_smart("SELL", ref_price, reduce_only=True, position_side="LONG", qty_override=q)
                         await self.c.fetch_account()
-                        ok = (err is None and self.c.long_pos <= 1e-12)
-                        self.last_action = "EXIT LONG ok" if ok else f"EXIT LONG FAILED ({err})"
-                        self.last_action_ts = now_ms()
-                        if ok:  # >>> TRAIL
-                            self.long_peak = None
+                        if err: self.last_action = f"EXIT LONG FAILED ({err})"; self.last_action_ts = now_ms(); return
+                    await asyncio.sleep(0.25)
+                    await self.c.fetch_account()
+                    _, err = await self.c.place_market_smart("SELL", ref_price, reduce_only=False, position_side="SHORT")
+                    await self.c.fetch_account()
+                    self.last_action = "ENTER SHORT ok" if err is None and self.c.short_pos > min_qty else f"ENTER SHORT FAILED ({err})"
+                    self.last_action_ts = now_ms()
 
             else:
                 pos = self.c.net_pos
                 if sig == "LONG":
-                    if pos > min_qty:
-                        self.last_action = "HOLD: already LONG"; self.last_action_ts = now_ms()
-                        self._refresh_state_nowait()
-                    else:
-                        closed_qty = 0.0
-                        if pos < -min_qty:
-                            q = self.c._round_qty_floor(abs(pos))
-                            _, err = await self.c.place_market_smart("BUY", ref_price, reduce_only=True, qty_override=q)
-                            await self.c.fetch_account()
-                            if err:
-                                self.last_action = f"EXIT SHORT FAILED ({err})"; self.last_action_ts = now_ms(); return
-                            self.last_action = "EXIT SHORT ok"; self.last_action_ts = now_ms()
-                            closed_qty = q
-                        await asyncio.sleep(0.25)
+                    if pos < -min_qty:
+                        q = self.c._round_qty_floor(abs(pos))
+                        _, err = await self.c.place_market_smart("BUY", ref_price, reduce_only=True, qty_override=q)
                         await self.c.fetch_account()
-                        _, err = await self.c.place_market_smart(
-                            "BUY", ref_price, reduce_only=False, open_prefer_qty=(closed_qty if closed_qty>0 else None)
-                        )
-                        await self.c.fetch_account()
-                        ok = (err is None and self.c.net_pos > min_qty)
-                        self.last_action = "ENTER LONG ok" if ok else f"ENTER LONG FAILED ({err})"
-                        self.last_action_ts = now_ms()
-                        if ok:  # >>> TRAIL
-                            self.long_peak = ref_price
-                            self.short_trough = None
+                        if err: self.last_action = f"EXIT SHORT FAILED ({err})"; self.last_action_ts = now_ms(); return
+                    await asyncio.sleep(0.25)
+                    await self.c.fetch_account()
+                    _, err = await self.c.place_market_smart("BUY", ref_price, reduce_only=False)
+                    await self.c.fetch_account()
+                    self.last_action = "ENTER LONG ok" if err is None and self.c.net_pos > min_qty else f"ENTER LONG FAILED ({err})"
+                    self.last_action_ts = now_ms()
 
                 elif sig == "SHORT":
-                    if pos < -min_qty:
-                        self.last_action = "HOLD: already SHORT"; self.last_action_ts = now_ms()
-                        self._refresh_state_nowait()
-                    else:
-                        closed_qty = 0.0
-                        if pos > min_qty:
-                            q = self.c._round_qty_floor(abs(pos))
-                            _, err = await self.c.place_market_smart("SELL", ref_price, reduce_only=True, qty_override=q)
-                            await self.c.fetch_account()
-                            if err:
-                                self.last_action = f"EXIT LONG FAILED ({err})"; self.last_action_ts = now_ms(); return
-                            self.last_action = "EXIT LONG ok"; self.last_action_ts = now_ms()
-                            closed_qty = q
-                        await asyncio.sleep(0.25)
-                        await self.c.fetch_account()
-                        _, err = await self.c.place_market_smart(
-                            "SELL", ref_price, reduce_only=False, open_prefer_qty=(closed_qty if closed_qty>0 else None)
-                        )
-                        await self.c.fetch_account()
-                        ok = (err is None and self.c.net_pos < -min_qty)
-                        self.last_action = "ENTER SHORT ok" if ok else f"ENTER SHORT FAILED ({err})"
-                        self.last_action_ts = now_ms()
-                        if ok:  # >>> TRAIL
-                            self.short_trough = ref_price
-                            self.long_peak = None
-
-                elif sig == "SHORT_EXIT_ONLY":
                     if pos > min_qty:
                         q = self.c._round_qty_floor(abs(pos))
                         _, err = await self.c.place_market_smart("SELL", ref_price, reduce_only=True, qty_override=q)
                         await self.c.fetch_account()
-                        ok = (err is None and self.c.net_pos <= 1e-12)
-                        self.last_action = "EXIT LONG ok" if ok else f"EXIT LONG FAILED ({err})"
-                        self.last_action_ts = now_ms()
-                        if ok:  # >>> TRAIL
-                            self.long_peak = None
+                        if err: self.last_action = f"EXIT LONG FAILED ({err})"; self.last_action_ts = now_ms(); return
+                    await asyncio.sleep(0.25)
+                    await self.c.fetch_account()
+                    _, err = await self.c.place_market_smart("SELL", ref_price, reduce_only=False)
+                    await self.c.fetch_account()
+                    self.last_action = "ENTER SHORT ok" if err is None and self.c.net_pos < -min_qty else f"ENTER SHORT FAILED ({err})"
+                    self.last_action_ts = now_ms()
 
             await self.c.fetch_account()
             self._refresh_state_nowait()
@@ -918,27 +702,48 @@ class EMARunner:
                         try:
                             e = json.loads(raw)
                             k = e.get("k") or {}
-                            px = _kline_tick_price(k)
+                            px = _kline_tick_close(k)             # ТОЛЬКО close
                             is_closed = bool(k.get("x", False))
-                            bar_key = f"{k.get('t')}_{k.get('t')}_{k.get('T')}"
+                            bar_key = f"{k.get('t')}_{k.get('T')}"
 
-                            # >>> TRAIL: проверяем на каждом тике
-                            await self._maybe_trail_exit(px)
+                            if not is_closed:
+                                # новый бар? (первый апдейт внутри бара)
+                                if bar_key != self.last_bar_key:
+                                    self.last_bar_key = bar_key
+                                    self.fired_cross_this_bar = False
+                                    self.prev_tick_ema50 = None
+                                    self.prev_tick_ema200 = None
 
-                            sig: Optional[str] = None
-                            if is_closed:
-                                await self._on_bar_close(px, bar_key)
-                                sig = self._signal_on_close_cross()
-                            else:
-                                if not self.on_close_only:
-                                    sig = self._signal_intrabar_cross(px, bar_key)
+                                if not self.on_close_only and not self.fired_cross_this_bar:
+                                    sig = self._intrabar_cross_signal(px, bar_key)
+                                    self.last_signal = sig
+                                    if sig:
+                                        await self._act_on_signal(sig, px)
+                                        self.fired_cross_this_bar = True
+                                continue
 
-                            if sig and self.mode == "LONG" and sig == "SHORT":
-                                sig = "SHORT_EXIT_ONLY"
+                            # бар закрылся -> проверяем кросс между закрытыми EMA
+                            prev50 = self.ema50
+                            prev200 = self.ema200
+                            next50 = tv_ema_next(prev50, px, 50) if prev50 is not None else None
+                            next200 = tv_ema_next(prev200, px, 200) if prev200 is not None else None
 
-                            self.last_signal = sig
-                            if sig:
-                                await self._act_on_signal(sig, px)
+                            sig_close = None
+                            if prev50 is not None and prev200 is not None and next50 is not None and next200 is not None:
+                                long_cross  = (prev50 <= prev200) and (next50 > next200)
+                                short_cross = (prev50 >= prev200) and (next50 < next200)
+                                if long_cross: sig_close = "LONG"
+                                elif short_cross: sig_close = "SHORT"
+
+                            # сначала обновим EMA и сбросим бар-флаги
+                            await self._on_bar_close(px, bar_key)
+
+                            # если требуется подтверждение на закрытии — действуем здесь
+                            if self.on_close_only and sig_close and not self.fired_cross_this_bar:
+                                self.last_signal = sig_close
+                                await self._act_on_signal(sig_close, px)
+                                self.fired_cross_this_bar = True
+
                         except Exception as ex:
                             self.last_error = f"kline parse: {ex}"
             except Exception as ex:
@@ -962,17 +767,20 @@ class EMARunner:
                             if closed:
                                 c = float(closed["c"])
                                 bar_key = str(int(closed["t"]))
-
-                                # >>> TRAIL: проверка каждый «секундный бар»
-                                await self._maybe_trail_exit(c)
+                                # для 1s источника у нас по факту нет интрабара — только закрытие секунды
+                                prev50 = self.ema50
+                                prev200 = self.ema200
+                                next50 = tv_ema_next(prev50, c, 50) if prev50 is not None else None
+                                next200 = tv_ema_next(prev200, c, 200) if prev200 is not None else None
+                                sig_close = None
+                                if prev50 is not None and prev200 is not None and next50 is not None and next200 is not None:
+                                    if (prev50 <= prev200) and (next50 > next200): sig_close = "LONG"
+                                    elif (prev50 >= prev200) and (next50 < next200): sig_close = "SHORT"
 
                                 await self._on_bar_close(c, bar_key)
-                                sig = self._signal_on_close_cross()
-                                if sig and self.mode == "LONG" and sig == "SHORT":
-                                    sig = "SHORT_EXIT_ONLY"
-                                self.last_signal = sig
-                                if sig:
-                                    await self._act_on_signal(sig, c)
+                                if sig_close:
+                                    self.last_signal = sig_close
+                                    await self._act_on_signal(sig_close, c)
                         except Exception as ex:
                             self.last_error = f"agg parse: {ex}"
             except Exception as ex:
@@ -1020,7 +828,7 @@ class EMARunner:
             "ema50": self.ema50,
             "ema100": self.ema100,
             "ema200": self.ema200,
-            "midFilter": self.mid_filter,  # отображаем, но не используем
+            "midFilter": self.mid_filter,
             "mode": self.mode,
             "onCloseOnly": self.on_close_only,
             "botState": self.bot_state,
@@ -1030,11 +838,7 @@ class EMARunner:
             "minNotional": self.c.min_notional,
             "minQty": self.c.min_qty,
             "pnlToday": self.pnl_today_realized,
-            "lastError": self.last_error,
-            # >>> TRAIL: статус
-            "trailRate": self.trail_rate,
-            "trailLongPeak": self.long_peak,
-            "trailShortTrough": self.short_trough,
+            "lastError": self.last_error
         }
 
 # ---------- Manager ----------
@@ -1061,13 +865,12 @@ class Manager:
         self.auto_current_symbol: Optional[str] = None
         self.auto_current_pct: Optional[float] = None
 
-        # --- КЭШ валидных USDT-M PERPETUAL символов (обновляется раз в 5 минут)
+        # --- КЭШ валидных USDT-M PERPETUAL символов
         self._valid_syms_cache: set[str] = set()
         self._valid_syms_cached_at_ms: int = 0
         self._valid_syms_ttl_ms: int = 5 * 60 * 1000
 
     async def _valid_usdtm_perp_symbols(self) -> set:
-        """Список реально торгуемых USDT-M PERPETUAL символов на фьючерсах Binance."""
         now = now_ms()
         if self._valid_syms_cache and (now - self._valid_syms_cached_at_ms) < self._valid_syms_ttl_ms:
             return self._valid_syms_cache
@@ -1089,7 +892,6 @@ class Manager:
             return self._valid_syms_cache
 
     async def pick_top1_symbol(self) -> Tuple[str, float]:
-        """Берём максимум priceChangePercent среди РЕАЛЬНО доступных USDT-M PERPETUAL. Если ничего не нашли/ошибка — фолбэк AUTO_FALLBACK_SYMBOL."""
         try:
             valid = await self._valid_usdtm_perp_symbols()
             if not valid:
@@ -1123,7 +925,7 @@ class Manager:
         self.cur_interval = interval
         self.cur_leverage = max(1, min(int(leverage), LEVERAGE_CAP))
         self.cur_mid_filter = bool(mid_filter)
-        self.cur_mode = "LONG" if str(mode).upper().startswith("LONG") else "BOTH"
+        self.cur_mode = DEFAULT_MODE
         self.cur_on_close_only = bool(on_close_only)
 
         syms_clean = [s.strip().upper() for s in (symbols or []) if s and s.strip()]
@@ -1152,7 +954,6 @@ class Manager:
         self._tasks.append(asyncio.create_task(self._auto_pick_loop()))
 
     async def stop(self):
-        # закрываем позиции у воркеров
         for r in list(self.runners.values()):
             try:
                 await r.c.fetch_account()
@@ -1205,8 +1006,7 @@ class Manager:
             await asyncio.sleep(60)
 
     async def refresh_income(self):
-        """Считаем только реальный PnL за СЕГОДНЯ (UTC), по каждому активному символу."""
-        end_ms = now_ms() + TIME_DRIFT_MS  # серверное время
+        end_ms = now_ms() + TIME_DRIFT_MS
         utc_now = dt.datetime.fromtimestamp(end_ms/1000.0, tz=dt.timezone.utc)
         today0 = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
         today_start_ms = int(today0.timestamp()*1000)
@@ -1244,18 +1044,15 @@ class Manager:
                 r.last_error = f"income: {e}"
 
     async def _reconcile_loop(self):
-        """Синхронизируемся с биржей и показываем внешние позиции."""
         while self.running:
             try:
                 ts = now_ms() + TIME_DRIFT_MS
-                # dualSide
                 try:
                     rds = await _signed_get_with_backoff(self.http, f"{BINANCE_API}/fapi/v1/positionSide/dual", params={"timestamp": ts, "recvWindow": 5000})
                     self.dual_side = bool(rds.json().get("dualSidePosition", False))
                 except Exception:
                     pass
 
-                # account snapshot
                 qp = _sign({"timestamp": ts, "recvWindow": 5000})
                 acc_r = await self.http.get(f"{BINANCE_API}/fapi/v2/account", params=qp, headers={"X-MBX-APIKEY": API_KEY})
                 acc_r.raise_for_status()
@@ -1267,7 +1064,6 @@ class Manager:
                         avail_usdt = float(a.get("availableBalance", "0"))
                         break
 
-                # внешние позиции
                 ext: Dict[str, Dict[str, Any]] = {}
                 tmp: Dict[str, Dict[str, float]] = {}
                 for p in acc.get("positions", []):
@@ -1306,7 +1102,6 @@ class Manager:
                     }
                 self.external = ext
 
-                # актуализируем аккаунт у активных воркеров
                 for r in self.runners.values():
                     try:
                         await r.c.fetch_account()
@@ -1319,11 +1114,6 @@ class Manager:
             await asyncio.sleep(3)
 
     async def _auto_pick_loop(self):
-        """
-        Если включён автопик (Symbols пусто):
-        - каждые 30 сек берём Топ-1 по 24h % среди валидных USDT-M PERP.
-        - если у бота НЕТ открытых позиций и Топ-1 изменился — перезапускаем на новый символ.
-        """
         while self.running:
             try:
                 if self.auto_pick:
@@ -1376,11 +1166,10 @@ class Manager:
 
 MANAGER = Manager()
 
-# ---------- UI ----------
+# ---------- UI (без изменений логики отображения) ----------
 TF_OPTIONS = "".join([f"<option{' selected' if tf==DEFAULT_INTERVAL else ''}>{tf}</option>" for tf in ALL_INTERVALS])
 
-HTML_TEMPLATE = """
-<!doctype html><html><head><meta charset="utf-8"/>
+HTML_TEMPLATE = """<!doctype html><html><head><meta charset="utf-8"/>
 <title>EMA Touch — Binance Futures</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
@@ -1408,7 +1197,6 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
 .waiting { background:#1f2937; color:#cbd5e1; }
 .long { background:rgba(34,197,94,.2); color:#86efac; }
 .short { background:rgba(239,68,68,.2); color:#fca5a5; }
-/* iOS-style switches */
 .switch { position:relative; width:54px; height:30px; background:#374151; border-radius:999px; transition:background .2s ease; border:1px solid #4b5563; cursor:pointer; }
 .switch input { display:none; }
 .switch .thumb { position:absolute; top:3px; left:3px; width:24px; height:24px; background:#fff; border-radius:50%; transition:left .2s ease; box-shadow: 0 2px 8px rgba(0,0,0,.35); }
@@ -1428,7 +1216,7 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
     <div>
       <label class="title">Symbols (comma)</label><br/>
       <input id="sym" type="text" value="" placeholder="choose a coin"/>
-      <div class="small">Оставь пустым — бот выберет Топ-1 24h % автоматически (USDT-M PERP). Фолбэк: CYBERUSDT.</div>
+      <div class="small">Оставь пустым — автопик Топ-1 24h % (USDT-M PERP). Фолбэк: CYBERUSDT.</div>
     </div>
     <div>
       <label class="title">Timeframe</label><br/>
@@ -1436,8 +1224,7 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
     </div>
     <div>
       <label class="title">Leverage</label><br/>
-      <!-- Значение берём из бэкенда при загрузке/refresh -->
-      <input id="lev" type="number" value="1" min="1" max="50" step="1"/>
+      <input id="lev" type="number" value="10" min="1" max="50" step="1"/>
     </div>
     <div>
       <label class="title">Mode</label><br/>
@@ -1452,8 +1239,8 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
     </div>
     <div>
       <label class="title">Signal: Close-only</label><br/>
-      <div id="closeonly" class="switch"><input type="checkbox"/><div class="thumb"></div></div>
-      <div class="small">OFF = Touch (intrabar)</div>
+      <div id="closeonly" class="switch on"><input type="checkbox"/><div class="thumb"></div></div>
+      <div class="small">ON = сигнал на закрытии бара (по умолчанию). OFF = разрешить интрабар-кроссы.</div>
     </div>
   </div>
   <div class="row" style="margin-top:12px;">
@@ -1470,9 +1257,8 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
   <table class="table">
     <thead>
       <tr>
-        <!-- Source и Signal скрыты -->
-        <th>Symbol</th><th>TF</th><th>Lev</th><th>Mode</th><th>Mid</th><th>Bot</th>
-        <th>Avail USDT</th><th>Equidity</th><th>Entry</th>
+        <th>Symbol</th><th>TF</th><th>Source</th><th>Lev</th><th>Mode</th><th>Mid</th><th>Signal</th><th>Bot</th>
+        <th>Avail USDT</th><th>Pos</th><th>Entry</th>
         <th>EMA50</th><th>EMA100</th><th>EMA200</th>
         <th>PnL Today (R)</th><th>Last Action</th><th>Error</th>
       </tr>
@@ -1480,25 +1266,18 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
     <tbody id="tbody"></tbody>
   </table>
   <div class="small" style="margin-top:8px;">
-    Реализованный PnL считается за календарные сутки UTC. Положительный — зелёный, отрицательный — красный.
+    Реализованный PnL считается за UTC-сутки.
   </div>
 </div>
 </div>
 
 <script>
-function toggleInit(id){
-  const el=document.getElementById(id);
-  el.addEventListener('click', ()=>{ el.classList.toggle('on'); });
-  return el;
-}
+function toggleInit(id){ const el=document.getElementById(id); el.addEventListener('click', ()=>{ el.classList.toggle('on'); }); return el; }
 const mid = toggleInit('mid');
 const closeonly = toggleInit('closeonly');
 
 function symbols(){
-  return document.getElementById('sym').value
-    .split(',')
-    .map(s=>s.trim())
-    .filter(Boolean); // если пусто — [] => авто-пик на сервере
+  return document.getElementById('sym').value.split(',').map(s=>s.trim()).filter(Boolean);
 }
 function params(){
   return {
@@ -1511,166 +1290,54 @@ function params(){
 }
 async function post(path, body){
   const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
-  if(!r.ok){
-    let msg = await r.text();
-    try{ msg = JSON.parse(msg).error || msg; }catch(_){}
-    throw new Error(msg);
-  }
+  if(!r.ok){ let msg = await r.text(); try{ msg = JSON.parse(msg).error || msg; }catch(_){}
+    throw new Error(msg); }
   return r.json();
 }
-async function get(path){
-  const r=await fetch(path);
-  if(!r.ok) throw new Error(await r.text());
-  return r.json();
-}
-
-// ---------- helpers ----------
+async function get(path){ const r=await fetch(path); if(!r.ok) throw new Error(await r.text()); return r.json(); }
+async function start(){ try{ const p=params(); await post('/api/start',{symbols:symbols(), ...p}); await refresh(); } catch(e){ alert('Start: '+e.message); } }
+async function stop(){ try{ await post('/api/stop',{}); await refresh(); } catch(e){ alert('Stop: '+e.message); } }
+async function restart(){ try{ const p=params(); await post('/api/restart',{symbols:symbols(), ...p}); await refresh(); } catch(e){ alert('Restart: '+e.message); } }
 function td(v){
-  const d=document.createElement('td');
-  if(v==null) v='';
-  if(typeof v==='number'){
-    d.textContent = Math.abs(v) >= 0.0001 ? v.toFixed(6) : v.toString();
-  } else {
-    d.textContent = v;
-  }
-  return d;
-}
-function tdInt(v){
-  const d=document.createElement('td');
-  const n = parseInt(v ?? 0);
-  d.textContent = isFinite(n) ? String(n) : '';
-  return d;
-}
-function tdMoney(v){
-  const d=document.createElement('td');
-  const n = Number(v);
-  d.textContent = isFinite(n) ? n.toFixed(2) : '';
-  return d;
+  const d=document.createElement('td'); if(v==null) v='';
+  if(typeof v==='number'){ d.textContent = Math.abs(v) >= 0.0001 ? v.toFixed(6) : v.toString(); }
+  else { d.textContent = v; } return d;
 }
 function stateBadge(state){
-  const span=document.createElement('span');
-  span.className='status-badge';
+  const span=document.createElement('span'); span.className='status-badge';
   if(state==='LONG'){ span.classList.add('long'); span.textContent='LONG'; }
   else if(state==='SHORT'){ span.classList.add('short'); span.textContent='SHORT'; }
   else { span.classList.add('waiting'); span.textContent=state || 'Waiting'; }
   return span;
 }
 function pnlCell(v){
-  const tdEl=document.createElement('td');
-  const b=document.createElement('span');
-  b.className='status-badge';
+  const tdEl=document.createElement('td'); const b=document.createElement('span'); b.className='status-badge';
   let num = (typeof v==='number') ? v : parseFloat(v||0) || 0;
   b.textContent = Math.abs(num) >= 0.0001 ? num.toFixed(6) : num.toString();
-  if(num > 0) b.classList.add('long');
-  else if(num < 0) b.classList.add('short');
-  else b.classList.add('waiting');
-  tdEl.appendChild(b);
-  return tdEl;
+  if(num > 0) b.classList.add('long'); else if(num < 0) b.classList.add('short'); else b.classList.add('waiting');
+  tdEl.appendChild(b); return tdEl;
 }
-
-// parse "L:0.1 / S:0.05"
-function parseLSPair(txt){
-  const res = {L:0, S:0};
-  if(typeof txt !== 'string') return res;
-  const mL = txt.match(/L:\s*([0-9.+-eE]+)/);
-  const mS = txt.match(/S:\s*([0-9.+-eE]+)/);
-  if(mL) res.L = parseFloat(mL[1]) || 0;
-  if(mS) res.S = parseFloat(mS[1]) || 0;
-  return res;
-}
-// compute equidity (USDT)
-function equidityUSDT(w){
-  try{
-    // external rows have string net/entry like "L:... / S:..."
-    if(w.source === 'external' || (typeof w.netPos === 'string')){
-      const q = parseLSPair(w.netPos || '');
-      const e = parseLSPair(w.entryPx || '');
-      const val = Math.abs(q.L)*(e.L||0) + Math.abs(q.S)*(e.S||0);
-      return val;
-    }else{
-      const qty = Math.abs(Number(w.netPos || 0));
-      const px  = Number(w.entryPx || 0);
-      return qty * px;
-    }
-  }catch(_){ return 0; }
-}
-
-function sigText(sig){ return ''; } // сигнал в UI не показываем
-
+function sigText(sig){ return sig || ''; }
 function pushRow(tb, w){
   const tr=document.createElement('tr');
-  tr.appendChild(td(w.symbol));
-  tr.appendChild(td(w.interval));
-  tr.appendChild(tdInt(w.leverage));                  // Lev как целое
-  tr.appendChild(td(w.mode||'-'));
-  tr.appendChild(td(w.midFilter?'ON':'OFF'));
-  const stateCell = document.createElement('td');
-  stateCell.appendChild(stateBadge(w.botState));
-  tr.appendChild(stateCell);
-  tr.appendChild(td(w.availableUSDT));
-  tr.appendChild(tdMoney(equidityUSDT(w)));           // Equidity (USDT)
-  tr.appendChild(td(w.entryPx));
-  tr.appendChild(td(w.ema50));
-  tr.appendChild(td(w.ema100));
-  tr.appendChild(td(w.ema200));
-  tr.appendChild(pnlCell(w.pnlToday));
-  tr.appendChild(td(w.lastAction||''));
-  tr.appendChild(td(w.lastError||''));
-  tb.appendChild(tr);
+  tr.appendChild(td(w.symbol)); tr.appendChild(td(w.interval)); tr.appendChild(td(w.source||'')); tr.appendChild(td(w.leverage));
+  tr.appendChild(td(w.mode||'-')); tr.appendChild(td(w.midFilter?'ON':'OFF')); tr.appendChild(td(sigText(w.lastSignal)));
+  const stateCell = document.createElement('td'); stateCell.appendChild(stateBadge(w.botState)); tr.appendChild(stateCell);
+  tr.appendChild(td(w.availableUSDT)); tr.appendChild(td(w.netPos)); tr.appendChild(td(w.entryPx));
+  tr.appendChild(td(w.ema50)); tr.appendChild(td(w.ema100)); tr.appendChild(td(w.ema200));
+  tr.appendChild(pnlCell(w.pnlToday)); tr.appendChild(td(w.lastAction||'')); tr.appendChild(td(w.lastError||'')); tb.appendChild(tr);
 }
-
 async function refresh(){
   const st=await get('/api/status');
-
-  // sync header flag
-  const flag=document.getElementById('flag');
-  flag.textContent = st.running?'Running':'Stopped';
-  flag.className = 'pill ' + (st.running?'on':'off');
-
-  // sync leverage input from backend (do not override while typing)
-  const levEl = document.getElementById('lev');
-  const backendLev = parseInt(st?.params?.leverage ?? 1);
-  if(document.activeElement !== levEl){
-    levEl.value = String(isFinite(backendLev) ? backendLev : 1);
-  }
-
-  // table
-  const tb=document.getElementById('tbody');
-  tb.innerHTML='';
-  (st.workers||[]).forEach(w=> pushRow(tb, w));
-  (st.external||[]).forEach(w=> pushRow(tb, w));
+  const flag=document.getElementById('flag'); flag.textContent = st.running?'Running':'Stopped'; flag.className = 'pill ' + (st.running?'on':'off');
+  const tb=document.getElementById('tbody'); tb.innerHTML='';
+  (st.workers||[]).forEach(w=> pushRow(tb, w)); (st.external||[]).forEach(w=> pushRow(tb, w));
 }
-
-async function start(){
-  try{ const p=params(); await post('/api/start',{symbols:symbols(), ...p}); await refresh(); }
-  catch(e){ alert('Start: '+e.message); }
-}
-async function stop(){
-  try{ await post('/api/stop',{}); await refresh(); }
-  catch(e){ alert('Stop: '+e.message); }
-}
-async function restart(){
-  try{ const p=params(); await post('/api/restart',{symbols:symbols(), ...p}); await refresh(); }
-  catch(e){ alert('Restart: '+e.message); }
-}
-
-async function loop(){
-  try{
-    await refresh();
-    const st=await get('/api/status');
-    setTimeout(loop, st.running?1200:3000);
-  }catch(e){
-    console.error(e);
-    setTimeout(loop,3000);
-  }
-}
+async function loop(){ try{ await refresh(); const st=await get('/api/status'); setTimeout(loop, st.running?1200:3000); }catch(e){ console.error(e); setTimeout(loop,3000); } }
 window.addEventListener('load', loop);
 window.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ document.getElementById('btnStart').click(); } });
-</script>
-</body></html>
-"""
-
-HTML = HTML_TEMPLATE
+</script></body></html>"""
+HTML = HTML_TEMPLATE.replace("%%TF_OPTIONS%%", TF_OPTIONS)
 
 # ---------- FastAPI ----------
 app = FastAPI()
@@ -1692,7 +1359,7 @@ async def api_start(req: Request):
     if not API_KEY or not API_SECRET:
         return JSONResponse({"error":"Missing BINANCE_API_KEY/SECRET"}, status_code=400)
     body = await req.json()
-    syms = body.get("symbols", [])  # пусто => auto-pick
+    syms = body.get("symbols", [])
     interval = str(body.get("interval", DEFAULT_INTERVAL))
     leverage = int(body.get("leverage", DEFAULT_LEVERAGE))
     mid_filter = bool(body.get("mid_filter", False))
@@ -1714,7 +1381,7 @@ async def api_restart(req: Request):
     if not API_KEY or not API_SECRET:
         return JSONResponse({"error":"Missing BINANCE_API_KEY/SECRET"}, status_code=400)
     body = await req.json()
-    syms = body.get("symbols", [])  # пусто => auto-пик
+    syms = body.get("symbols", [])
     interval = str(body.get("interval", DEFAULT_INTERVAL))
     leverage = int(body.get("leverage", DEFAULT_LEVERAGE))
     mid_filter = bool(body.get("mid_filter", False))
