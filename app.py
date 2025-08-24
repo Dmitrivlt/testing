@@ -1169,7 +1169,8 @@ MANAGER = Manager()
 # ---------- UI (без изменений логики отображения) ----------
 TF_OPTIONS = "".join([f"<option{' selected' if tf==DEFAULT_INTERVAL else ''}>{tf}</option>" for tf in ALL_INTERVALS])
 
-HTML_TEMPLATE = """<!doctype html><html><head><meta charset="utf-8"/>
+HTML_TEMPLATE = """
+<!doctype html><html><head><meta charset="utf-8"/>
 <title>EMA Touch — Binance Futures</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
@@ -1197,6 +1198,7 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
 .waiting { background:#1f2937; color:#cbd5e1; }
 .long { background:rgba(34,197,94,.2); color:#86efac; }
 .short { background:rgba(239,68,68,.2); color:#fca5a5; }
+/* iOS-style switches */
 .switch { position:relative; width:54px; height:30px; background:#374151; border-radius:999px; transition:background .2s ease; border:1px solid #4b5563; cursor:pointer; }
 .switch input { display:none; }
 .switch .thumb { position:absolute; top:3px; left:3px; width:24px; height:24px; background:#fff; border-radius:50%; transition:left .2s ease; box-shadow: 0 2px 8px rgba(0,0,0,.35); }
@@ -1216,7 +1218,7 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
     <div>
       <label class="title">Symbols (comma)</label><br/>
       <input id="sym" type="text" value="" placeholder="choose a coin"/>
-      <div class="small">Оставь пустым — автопик Топ-1 24h % (USDT-M PERP). Фолбэк: CYBERUSDT.</div>
+      <div class="small">Оставь пустым — бот выберет Топ-1 24h % автоматически (USDT-M PERP). Фолбэк: CYBERUSDT.</div>
     </div>
     <div>
       <label class="title">Timeframe</label><br/>
@@ -1224,7 +1226,8 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
     </div>
     <div>
       <label class="title">Leverage</label><br/>
-      <input id="lev" type="number" value="10" min="1" max="50" step="1"/>
+      <!-- Значение берём из бэкенда при загрузке/refresh -->
+      <input id="lev" type="number" value="1" min="1" max="50" step="1"/>
     </div>
     <div>
       <label class="title">Mode</label><br/>
@@ -1239,8 +1242,8 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
     </div>
     <div>
       <label class="title">Signal: Close-only</label><br/>
-      <div id="closeonly" class="switch on"><input type="checkbox"/><div class="thumb"></div></div>
-      <div class="small">ON = сигнал на закрытии бара (по умолчанию). OFF = разрешить интрабар-кроссы.</div>
+      <div id="closeonly" class="switch"><input type="checkbox"/><div class="thumb"></div></div>
+      <div class="small">OFF = Touch (intrabar)</div>
     </div>
   </div>
   <div class="row" style="margin-top:12px;">
@@ -1257,8 +1260,9 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
   <table class="table">
     <thead>
       <tr>
-        <th>Symbol</th><th>TF</th><th>Source</th><th>Lev</th><th>Mode</th><th>Mid</th><th>Signal</th><th>Bot</th>
-        <th>Avail USDT</th><th>Pos</th><th>Entry</th>
+        <!-- Source и Signal скрыты -->
+        <th>Symbol</th><th>TF</th><th>Lev</th><th>Mode</th><th>Mid</th><th>Bot</th>
+        <th>Avail USDT</th><th>Equidity</th><th>Entry</th>
         <th>EMA50</th><th>EMA100</th><th>EMA200</th>
         <th>PnL Today (R)</th><th>Last Action</th><th>Error</th>
       </tr>
@@ -1266,18 +1270,25 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
     <tbody id="tbody"></tbody>
   </table>
   <div class="small" style="margin-top:8px;">
-    Реализованный PnL считается за UTC-сутки.
+    Реализованный PnL считается за календарные сутки UTC. Положительный — зелёный, отрицательный — красный.
   </div>
 </div>
 </div>
 
 <script>
-function toggleInit(id){ const el=document.getElementById(id); el.addEventListener('click', ()=>{ el.classList.toggle('on'); }); return el; }
+function toggleInit(id){
+  const el=document.getElementById(id);
+  el.addEventListener('click', ()=>{ el.classList.toggle('on'); });
+  return el;
+}
 const mid = toggleInit('mid');
 const closeonly = toggleInit('closeonly');
 
 function symbols(){
-  return document.getElementById('sym').value.split(',').map(s=>s.trim()).filter(Boolean);
+  return document.getElementById('sym').value
+    .split(',')
+    .map(s=>s.trim())
+    .filter(Boolean); // если пусто — [] => авто-пик на сервере
 }
 function params(){
   return {
@@ -1290,53 +1301,164 @@ function params(){
 }
 async function post(path, body){
   const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
-  if(!r.ok){ let msg = await r.text(); try{ msg = JSON.parse(msg).error || msg; }catch(_){}
-    throw new Error(msg); }
+  if(!r.ok){
+    let msg = await r.text();
+    try{ msg = JSON.parse(msg).error || msg; }catch(_){}
+    throw new Error(msg);
+  }
   return r.json();
 }
-async function get(path){ const r=await fetch(path); if(!r.ok) throw new Error(await r.text()); return r.json(); }
-async function start(){ try{ const p=params(); await post('/api/start',{symbols:symbols(), ...p}); await refresh(); } catch(e){ alert('Start: '+e.message); } }
-async function stop(){ try{ await post('/api/stop',{}); await refresh(); } catch(e){ alert('Stop: '+e.message); } }
-async function restart(){ try{ const p=params(); await post('/api/restart',{symbols:symbols(), ...p}); await refresh(); } catch(e){ alert('Restart: '+e.message); } }
+async function get(path){
+  const r=await fetch(path);
+  if(!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// ---------- helpers ----------
 function td(v){
-  const d=document.createElement('td'); if(v==null) v='';
-  if(typeof v==='number'){ d.textContent = Math.abs(v) >= 0.0001 ? v.toFixed(6) : v.toString(); }
-  else { d.textContent = v; } return d;
+  const d=document.createElement('td');
+  if(v==null) v='';
+  if(typeof v==='number'){
+    d.textContent = Math.abs(v) >= 0.0001 ? v.toFixed(6) : v.toString();
+  } else {
+    d.textContent = v;
+  }
+  return d;
+}
+function tdInt(v){
+  const d=document.createElement('td');
+  const n = parseInt(v ?? 0);
+  d.textContent = isFinite(n) ? String(n) : '';
+  return d;
+}
+function tdMoney(v){
+  const d=document.createElement('td');
+  const n = Number(v);
+  d.textContent = isFinite(n) ? n.toFixed(2) : '';
+  return d;
 }
 function stateBadge(state){
-  const span=document.createElement('span'); span.className='status-badge';
+  const span=document.createElement('span');
+  span.className='status-badge';
   if(state==='LONG'){ span.classList.add('long'); span.textContent='LONG'; }
   else if(state==='SHORT'){ span.classList.add('short'); span.textContent='SHORT'; }
   else { span.classList.add('waiting'); span.textContent=state || 'Waiting'; }
   return span;
 }
 function pnlCell(v){
-  const tdEl=document.createElement('td'); const b=document.createElement('span'); b.className='status-badge';
+  const tdEl=document.createElement('td');
+  const b=document.createElement('span');
+  b.className='status-badge';
   let num = (typeof v==='number') ? v : parseFloat(v||0) || 0;
   b.textContent = Math.abs(num) >= 0.0001 ? num.toFixed(6) : num.toString();
-  if(num > 0) b.classList.add('long'); else if(num < 0) b.classList.add('short'); else b.classList.add('waiting');
-  tdEl.appendChild(b); return tdEl;
+  if(num > 0) b.classList.add('long');
+  else if(num < 0) b.classList.add('short');
+  else b.classList.add('waiting');
+  tdEl.appendChild(b);
+  return tdEl;
 }
-function sigText(sig){ return sig || ''; }
+
+// parse "L:0.1 / S:0.05"
+function parseLSPair(txt){
+  const res = {L:0, S:0};
+  if(typeof txt !== 'string') return res;
+  const mL = txt.match(/L:\s*([0-9.+-eE]+)/);
+  const mS = txt.match(/S:\s*([0-9.+-eE]+)/);
+  if(mL) res.L = parseFloat(mL[1]) || 0;
+  if(mS) res.S = parseFloat(mS[1]) || 0;
+  return res;
+}
+// compute equidity (USDT)
+function equidityUSDT(w){
+  try{
+    // external rows have string net/entry like "L:... / S:..."
+    if(w.source === 'external' || (typeof w.netPos === 'string')){
+      const q = parseLSPair(w.netPos || '');
+      const e = parseLSPair(w.entryPx || '');
+      const val = Math.abs(q.L)*(e.L||0) + Math.abs(q.S)*(e.S||0);
+      return val;
+    }else{
+      const qty = Math.abs(Number(w.netPos || 0));
+      const px  = Number(w.entryPx || 0);
+      return qty * px;
+    }
+  }catch(_){ return 0; }
+}
+
+function sigText(sig){ return ''; } // сигнал в UI не показываем
+
 function pushRow(tb, w){
   const tr=document.createElement('tr');
-  tr.appendChild(td(w.symbol)); tr.appendChild(td(w.interval)); tr.appendChild(td(w.source||'')); tr.appendChild(td(w.leverage));
-  tr.appendChild(td(w.mode||'-')); tr.appendChild(td(w.midFilter?'ON':'OFF')); tr.appendChild(td(sigText(w.lastSignal)));
-  const stateCell = document.createElement('td'); stateCell.appendChild(stateBadge(w.botState)); tr.appendChild(stateCell);
-  tr.appendChild(td(w.availableUSDT)); tr.appendChild(td(w.netPos)); tr.appendChild(td(w.entryPx));
-  tr.appendChild(td(w.ema50)); tr.appendChild(td(w.ema100)); tr.appendChild(td(w.ema200));
-  tr.appendChild(pnlCell(w.pnlToday)); tr.appendChild(td(w.lastAction||'')); tr.appendChild(td(w.lastError||'')); tb.appendChild(tr);
+  tr.appendChild(td(w.symbol));
+  tr.appendChild(td(w.interval));
+  tr.appendChild(tdInt(w.leverage));                  // Lev как целое
+  tr.appendChild(td(w.mode||'-'));
+  tr.appendChild(td(w.midFilter?'ON':'OFF'));
+  const stateCell = document.createElement('td');
+  stateCell.appendChild(stateBadge(w.botState));
+  tr.appendChild(stateCell);
+  tr.appendChild(td(w.availableUSDT));
+  tr.appendChild(tdMoney(equidityUSDT(w)));           // Equidity (USDT)
+  tr.appendChild(td(w.entryPx));
+  tr.appendChild(td(w.ema50));
+  tr.appendChild(td(w.ema100));
+  tr.appendChild(td(w.ema200));
+  tr.appendChild(pnlCell(w.pnlToday));
+  tr.appendChild(td(w.lastAction||''));
+  tr.appendChild(td(w.lastError||''));
+  tb.appendChild(tr);
 }
+
 async function refresh(){
   const st=await get('/api/status');
-  const flag=document.getElementById('flag'); flag.textContent = st.running?'Running':'Stopped'; flag.className = 'pill ' + (st.running?'on':'off');
-  const tb=document.getElementById('tbody'); tb.innerHTML='';
-  (st.workers||[]).forEach(w=> pushRow(tb, w)); (st.external||[]).forEach(w=> pushRow(tb, w));
+
+  // sync header flag
+  const flag=document.getElementById('flag');
+  flag.textContent = st.running?'Running':'Stopped';
+  flag.className = 'pill ' + (st.running?'on':'off');
+
+  // sync leverage input from backend (do not override while typing)
+  const levEl = document.getElementById('lev');
+  const backendLev = parseInt(st?.params?.leverage ?? 1);
+  if(document.activeElement !== levEl){
+    levEl.value = String(isFinite(backendLev) ? backendLev : 1);
+  }
+
+  // table
+  const tb=document.getElementById('tbody');
+  tb.innerHTML='';
+  (st.workers||[]).forEach(w=> pushRow(tb, w));
+  (st.external||[]).forEach(w=> pushRow(tb, w));
 }
-async function loop(){ try{ await refresh(); const st=await get('/api/status'); setTimeout(loop, st.running?1200:3000); }catch(e){ console.error(e); setTimeout(loop,3000); } }
+
+async function start(){
+  try{ const p=params(); await post('/api/start',{symbols:symbols(), ...p}); await refresh(); }
+  catch(e){ alert('Start: '+e.message); }
+}
+async function stop(){
+  try{ await post('/api/stop',{}); await refresh(); }
+  catch(e){ alert('Stop: '+e.message); }
+}
+async function restart(){
+  try{ const p=params(); await post('/api/restart',{symbols:symbols(), ...p}); await refresh(); }
+  catch(e){ alert('Restart: '+e.message); }
+}
+
+async function loop(){
+  try{
+    await refresh();
+    const st=await get('/api/status');
+    setTimeout(loop, st.running?1200:3000);
+  }catch(e){
+    console.error(e);
+    setTimeout(loop,3000);
+  }
+}
 window.addEventListener('load', loop);
 window.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ document.getElementById('btnStart').click(); } });
-</script></body></html>"""
+</script>
+</body></html>
+"""
 HTML = HTML_TEMPLATE.replace("%%TF_OPTIONS%%", TF_OPTIONS)
 
 # ---------- FastAPI ----------
