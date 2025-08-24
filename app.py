@@ -1,17 +1,10 @@
-# app.py — Binance USDT-M Futures EMA Touch Trader (v1.8.6)
-# Новое в v1.8.6:
-# - Автовыбор монеты Топ-1 по росту за 24ч среди РЕАЛЬНО доступных USDT-M PERPETUAL (status=TRADING).
-# - Если поле "Symbols" пустое, включается auto-pick: бот берёт Топ-1; если Топ-1 меняется и позиций нет — перегружается на новый символ.
-# - Фолбэк при любой ошибке авто-пика: CYBERUSDT.
-#
-# Из v1.8.5:
-# - Убраны PnL 1/7/30 дней; добавлен только PnL за сегодня (UTC), только REALIZED_PNL (точный).
-# - PnL Today (R) в UI как бейдж: >0 зелёный, <0 красный, 0 серый.
-# - Улучшены перевороты: сначала закрытие, микропаузa, повторный fetch_account, попытка открыть прежним объёмом.
-# - Точные проверки minNotional/minQty; корректное уменьшение количества; в hedge-режиме reduceOnly НЕ отправляем.
-# - По умолчанию DEFAULT_LEVERAGE=10; MID_GAP_THRESHOLD берётся из env (по умолчанию 1%).
-#
-# Зависимости:  pip install fastapi uvicorn httpx websockets
+# app.py — Binance USDT-M Futures EMA Touch Trader (v1.8.6, custom UI)
+# Изменения:
+# - UI: убраны Source/Signal; Avail USDT -> Balance; Pos -> Position ($) по lastPrice; PnL Today -> uPnL (+ uPnL%).
+# - Добавлен favicon в <head>.
+# - Leverage формат целым числом.
+# - Сервер: в статусе появились lastPrice, uPnL, uPnL_pct, balance (дублирует availableUSDT).
+# - uPnL считается по mark≈lastPrice: (last - entry)*net_pos (one-way) или раздельно по LONG/SHORT (hedge).
 
 import os, time, math, json, asyncio, random, hmac, hashlib
 import datetime as dt
@@ -111,24 +104,13 @@ async def _signed_get_with_backoff(http: httpx.AsyncClient, url: str, *,
 
 # ---------- TV-like EMA ----------
 def tv_ema_series(closes: List[float], length: int) -> List[Optional[float]]:
-    """
-    Полный эквивалент pandas ewm(adjust=False) для EMA:
-      - seed = первый close ряда (а не SMA первых N баров)
-      - EMA_t = alpha*close_t + (1-alpha)*EMA_{t-1}, где alpha=2/(length+1)
-      - значения считаются на каждом элементе ряда (как ewm), 
-        но использовать будем только последний (как у 'Васи' в on_bar_close)
-    """
     n = len(closes)
     out: List[Optional[float]] = [None] * n
     if length < 1 or n == 0:
         return out
-
     alpha = 2.0 / (length + 1.0)
-
-    # seed строго = первый close (эквивалент ewm(..., adjust=False))
     prev = float(closes[0])
     out[0] = prev
-
     for i in range(1, n):
         c = float(closes[i])
         prev = alpha * c + (1.0 - alpha) * prev
@@ -299,12 +281,10 @@ class FuturesClient:
         return float(f"{q:.{prec}f}")
 
     def min_qty_for_notional(self, price: float) -> float:
-        """Минимум, чтобы удовлетворить и minNotional, и minQty."""
         need_by_notional = self._round_qty_ceil(self.min_notional / max(price, 1e-12))
         return max(self.min_qty, need_by_notional)
 
     def max_affordable_qty(self, price: float) -> float:
-        """Максимум, исходя из доступного нотионала (учитываем буфер)."""
         notional_cap = max(0.0, self.available_usdt - self.available_usdt*FEE_BUFFER_RATE) * self.leverage * UTILIZATION
         q = self._round_qty_floor(notional_cap / max(price, 1e-12))
         if self.max_qty > 0:
@@ -331,10 +311,6 @@ class FuturesClient:
     async def place_market(self, side: str, qty: float, *,
                            reduce_only: bool=False,
                            position_side: Optional[str]=None) -> Tuple[Optional[int], Optional[str]]:
-        """
-        Универсальный маркет-ордер.
-        ВНИМАНИЕ: в hedge-режиме reduceOnly НЕ отправляем (иначе -1106).
-        """
         ts = now_ms() + TIME_DRIFT_MS
         params = {
             "symbol": self.symbol, "side": side, "type": "MARKET",
@@ -378,12 +354,6 @@ class FuturesClient:
         qty_override: Optional[float] = None,
         open_prefer_qty: Optional[float] = None
     ) -> Tuple[Optional[int], Optional[str]]:
-        """
-        Маркет с ретраями.
-        - Для reduce_only берём фактический размер позиции (или qty_override).
-        - Для открытия сначала пробуем open_prefer_qty (например, размер только что закрытой позиции),
-          если не проходит — уменьшаем ступенями, потом fallback к compute_order_qty().
-        """
         price = ref_price if ref_price > 0 else (await self.fetch_last_price() or 0.0)
 
         await self.fetch_account()
@@ -517,6 +487,7 @@ class EMARunner:
         self.ema200: Optional[float] = None
 
         self.prev_tick_price: Optional[float] = None
+        self.last_price: Optional[float] = None  # <— для uPnL/нотионала
 
         self.running = False
         self._tasks: List[asyncio.Task] = []
@@ -524,7 +495,6 @@ class EMARunner:
         # UI
         self.last_signal: Optional[str] = None
         self.last_action: Optional[str] = None
-        # lastActionTs можно оставить в статусе, если нужно
         self.last_action_ts: Optional[int] = None
         self.last_error: Optional[str] = None
         self.source: str = "kline"  # "kline" | "aggTrade_1s"
@@ -556,6 +526,7 @@ class EMARunner:
             self.ema50  = e50[-1]
             self.ema100 = e100[-1]
             self.ema200 = e200[-1]
+            self.last_price = closes[-1]
         except Exception as e:
             self.last_error = f"warmup_native: {e}"
 
@@ -591,6 +562,7 @@ class EMARunner:
         self.ema50  = e50[-1]
         self.ema100 = e100[-1]
         self.ema200 = e200[-1]
+        self.last_price = closes[-1]
 
     # ---------- EMA update only on bar close ----------
     async def _on_bar_close(self, close_price: float, bar_key: str):
@@ -616,6 +588,7 @@ class EMARunner:
         self.last_bar_key = bar_key
         self.fired_50_this_bar = False
         self.fired_200_this_bar = False
+        self.last_price = close_price
 
     # ---------- Touch detector (интрабар) ----------
     def _touch_signal_on_price(self, price: float, bar_key: Optional[str]) -> Optional[str]:
@@ -623,6 +596,7 @@ class EMARunner:
             return None
         prev = self.prev_tick_price if self.prev_tick_price is not None else price
         self.prev_tick_price = price
+        self.last_price = price
 
         sig: Optional[str] = None
         same_bar = (bar_key is not None and bar_key == self.last_bar_key)
@@ -667,7 +641,26 @@ class EMARunner:
         except Exception:
             self.bot_state = "Waiting"
 
-    # ---------- ДЕЙСТВИЯ ПО СИГНАЛУ (flip-логика) ----------
+    # ---------- uPnL helper ----------
+    def _compute_upnl(self) -> Tuple[Optional[float], Optional[float]]:
+        lp = self.last_price
+        if lp is None or lp <= 0:
+            return (None, None)
+        upnl = 0.0
+        if self.c.dual_side:
+            if self.c.long_pos > 0 and self.c.long_entry > 0:
+                upnl += (lp - self.c.long_entry) * self.c.long_pos
+            if self.c.short_pos > 0 and self.c.short_entry > 0:
+                upnl += (self.c.short_entry - lp) * self.c.short_pos
+            notional = (self.c.long_pos * lp) + (self.c.short_pos * lp)
+        else:
+            notional = abs(self.c.net_pos) * lp
+            if abs(self.c.net_pos) > 0 and self.c.entry_px > 0:
+                upnl = (lp - self.c.entry_px) * self.c.net_pos
+        pct = (upnl / notional * 100.0) if notional and notional > 0 else None
+        return (upnl, pct)
+
+    # ---------- ДЕЙСТВИЯ ПО СИГНАЛУ ----------
     async def _act_on_signal(self, sig: Optional[str], ref_price: float):
         try:
             await self.c.fetch_account()
@@ -899,13 +892,15 @@ class EMARunner:
         self._tasks.clear()
 
     def status(self) -> dict:
+        upnl, upnl_pct = self._compute_upnl()
         return {
             "symbol": self.symbol,
             "interval": self.interval,
             "source": self.source,
             "leverage": self.target_leverage,
             "hedgeMode": self.c.dual_side,
-            "availableUSDT": self.c.available_usdt,
+            "balance": self.c.available_usdt,     # <— переименовано для UI
+            "availableUSDT": self.c.available_usdt,  # (оставлено для совместимости, если где-то используется)
             "netPos": self.c.net_pos,
             "entryPx": self.c.entry_px,
             "ema50": self.ema50,
@@ -920,7 +915,10 @@ class EMARunner:
             "lastActionTs": self.last_action_ts,
             "minNotional": self.c.min_notional,
             "minQty": self.c.min_qty,
-            "pnlToday": self.pnl_today_realized,
+            "lastPrice": self.last_price,         # <— для расчёта нотионала в UI
+            "uPnL": upnl,                         # <— нереализованный PnL (USDT)
+            "uPnL_pct": upnl_pct,                 # <— % от текущего нотионала
+            "pnlToday": self.pnl_today_realized,  # (не используется в UI теперь)
             "lastError": self.last_error
         }
 
@@ -951,7 +949,6 @@ class Manager:
         self._valid_syms_ttl_ms: int = 5 * 60 * 1000
 
     async def _valid_usdtm_perp_symbols(self) -> set:
-        """Список реально торгуемых USDT-M PERPETUAL символов на фьючерсах Binance."""
         now = now_ms()
         if self._valid_syms_cache and (now - self._valid_syms_cached_at_ms) < self._valid_syms_ttl_ms:
             return self._valid_syms_cache
@@ -974,10 +971,6 @@ class Manager:
         return self._valid_syms_cache
 
     async def pick_top1_symbol(self) -> Tuple[str, float]:
-        """
-        Берём максимум priceChangePercent среди РЕАЛЬНО доступных USDT-M PERPETUAL.
-        Если ничего не нашли/ошибка — фолбэк AUTO_FALLBACK_SYMBOL.
-        """
         try:
             valid = await self._valid_usdtm_perp_symbols()
             if not valid:
@@ -1015,11 +1008,11 @@ class Manager:
             raise ValueError(f"Unsupported interval: {interval}")
         self.cur_interval = interval
         self.cur_leverage = max(1, min(int(leverage), LEVERAGE_CAP))
+    # ...
         self.cur_mid_filter = bool(mid_filter)
         self.cur_mode = "LONG" if str(mode).upper().startswith("LONG") else "BOTH"
         self.cur_on_close_only = bool(on_close_only)
 
-        # --- обработка auto-pick ---
         syms_clean = [s.strip().upper() for s in (symbols or []) if s and s.strip()]
         self.auto_pick = (len(syms_clean) == 0)
         if self.auto_pick:
@@ -1046,7 +1039,6 @@ class Manager:
         self._tasks.append(asyncio.create_task(self._auto_pick_loop()))
 
     async def stop(self):
-        # закрываем позиции у воркеров
         for r in list(self.runners.values()):
             try:
                 await r.c.fetch_account()
@@ -1102,11 +1094,7 @@ class Manager:
             await asyncio.sleep(60)
 
     async def refresh_income(self):
-        """
-        Считаем только реальный PnL за СЕГОДНЯ (UTC), по каждому активному символу.
-        Используем /fapi/v1/income с incomeType=REALIZED_PNL и пагинацией по startTime.
-        """
-        end_ms = now_ms() + TIME_DRIFT_MS  # серверное время
+        end_ms = now_ms() + TIME_DRIFT_MS
         utc_now = dt.datetime.fromtimestamp(end_ms/1000.0, tz=dt.timezone.utc)
         today0 = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
         today_start_ms = int(today0.timestamp()*1000)
@@ -1154,11 +1142,9 @@ class Manager:
                 r.last_error = f"income: {e}"
 
     async def _reconcile_loop(self):
-        """Синхронизируемся с биржей и показываем внешние позиции."""
         while self.running:
             try:
                 ts = now_ms() + TIME_DRIFT_MS
-                # dualSide
                 try:
                     rds = await _signed_get_with_backoff(self.http, f"{BINANCE_API}/fapi/v1/positionSide/dual",
                                                          params={"timestamp": ts, "recvWindow": 5000})
@@ -1166,7 +1152,6 @@ class Manager:
                 except Exception:
                     pass
 
-                # account snapshot
                 qp = _sign({"timestamp": ts, "recvWindow": 5000})
                 acc_r = await self.http.get(f"{BINANCE_API}/fapi/v2/account", params=qp, headers={"X-MBX-APIKEY": API_KEY})
                 acc_r.raise_for_status()
@@ -1178,7 +1163,6 @@ class Manager:
                         avail_usdt = float(a.get("availableBalance", "0"))
                         break
 
-                # внешние позиции (символы, которых нет среди активных воркеров)
                 ext: Dict[str, Dict[str, Any]] = {}
                 tmp: Dict[str, Dict[str, float]] = {}
                 for p in acc.get("positions", []):
@@ -1212,15 +1196,15 @@ class Manager:
                     ext[sym] = {
                         "symbol": sym, "interval": self.cur_interval, "source": "external",
                         "leverage": self.cur_leverage, "mode": "-", "midFilter": False, "lastSignal": None,
-                        "botState": state, "availableUSDT": avail_usdt,
+                        "botState": state, "balance": avail_usdt, "availableUSDT": avail_usdt,
                         "netPos": pos_text, "entryPx": entry_text,
                         "ema50": None, "ema100": None, "ema200": None,
+                        "lastPrice": None, "uPnL": None, "uPnL_pct": None,
                         "pnlToday": 0.0,
                         "lastAction": "External position", "lastError": None
                     }
                 self.external = ext
 
-                # актуализируем аккаунт у активных воркеров + обновляем их bot_state
                 for r in self.runners.values():
                     try:
                         await r.c.fetch_account()
@@ -1233,14 +1217,9 @@ class Manager:
             await asyncio.sleep(3)
 
     async def _auto_pick_loop(self):
-        """Если включён автопик (поле Symbols пустое при старте):
-           - каждые 30 сек берём Топ-1 по 24h % среди валидных USDT-M PERP.
-           - если у бота НЕТ открытых позиций (по всем воркерам) и Топ-1 изменился — перезапускаем на новый символ.
-        """
         while self.running:
             try:
                 if self.auto_pick:
-                    # Есть ли открытые позиции? Если есть — ничего не меняем.
                     any_open = False
                     for r in self.runners.values():
                         try:
@@ -1260,13 +1239,11 @@ class Manager:
                     if not any_open:
                         top_sym, top_pct = await self.pick_top1_symbol()
                         if top_sym and (top_sym not in self.runners):
-                            # перезапуск на новый Топ-1
                             await self.restart([top_sym], self.cur_interval, self.cur_leverage,
                                                self.cur_mid_filter, self.cur_mode, self.cur_on_close_only)
                             self.auto_pick = True
                             self.auto_current_symbol = top_sym
                             self.auto_current_pct = top_pct
-                            # после restart этот loop перезапустится заново внутри start()
                             return
                         else:
                             self.auto_current_symbol = top_sym
@@ -1302,6 +1279,7 @@ TF_OPTIONS = "".join([f"<option{' selected' if tf==DEFAULT_INTERVAL else ''}>{tf
 HTML_TEMPLATE = """
 <!doctype html><html><head><meta charset="utf-8"/>
 <title>Volontyr — Bot</title>
+<link rel="icon" href="https://www.google.com/imgres?q=btc%20icon&imgurl=https%3A%2F%2Fmedia.istockphoto.com%2Fid%2F1139020309%2Fvector%2Fbitcoin-internet-money-icon-vector.jpg%3Fs%3D612x612%26w%3D0%26k%3D20%26c%3DvcRUEDzhndMOctdM7PN1qmipo5rY_aOByWFW0IkW8bs%3D&imgrefurl=https%3A%2F%2Fwww.istockphoto.com%2Fillustrations%2Fbitcoin-icon&docid=2BBla4FhEiIvOM&tbnid=YEPC3oMWYv1CdM&vet=12ahUKEwjokJjkq6OPAxVnRPEDHRSPGnYQM3oECCIQAA..i&w=612&h=612&hcb=2&ved=2ahUKEwjokJjkq6OPAxVnRPEDHRSPGnYQM3oECCIQAA">
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
 :root {
@@ -1397,16 +1375,16 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
     <table class="table">
       <thead>
         <tr>
-          <th>Symbol</th><th>TF</th><th>Source</th><th>Lev</th><th>Mode</th><th>Mid</th><th>Signal</th><th>Bot</th>
-          <th>Avail USDT</th><th>Pos</th><th>Entry</th>
+          <th>Symbol</th><th>TF</th><th>Lev</th><th>Mode</th><th>Mid</th><th>Bot</th>
+          <th>Balance</th><th>Position ($)</th><th>Entry</th>
           <th>EMA50</th><th>EMA100</th><th>EMA200</th>
-          <th>PnL Today (R)</th><th>Last Action</th><th>Error</th>
+          <th>uPnL</th><th>Last Action</th><th>Error</th>
         </tr>
       </thead>
       <tbody id="tbody"></tbody>
     </table>
     <div class="small" style="margin-top:8px;">
-      Реализованный PnL считается за календарные сутки UTC. Положительный — зелёный, отрицательный — красный.
+      uPnL считается по текущей цене. Положительный — зелёный, отрицательный — красный.
     </div>
   </div>
 </div>
@@ -1453,8 +1431,21 @@ function td(v){
   const d=document.createElement('td');
   if(v==null) v='';
   if(typeof v==='number'){
+    // общее форматирование чисел (по умолчанию 6 знаков)
     d.textContent = Math.abs(v) >= 0.0001 ? v.toFixed(6) : v.toString();
   } else { d.textContent = v; }
+  return d;
+}
+function tdInt(v){
+  const d=document.createElement('td');
+  if(v==null || isNaN(v)) d.textContent='';
+  else d.textContent = parseInt(v);
+  return d;
+}
+function tdMoney(v){
+  const d=document.createElement('td');
+  if(v==null || isNaN(v)) d.textContent='';
+  else d.textContent = Number(v).toFixed(2);
   return d;
 }
 function stateBadge(state){
@@ -1464,17 +1455,14 @@ function stateBadge(state){
   else { span.classList.add('waiting'); span.textContent=state || 'Waiting'; }
   return span;
 }
-function sigText(sig){
-  if(!sig) return '';
-  if(sig==='SHORT_EXIT_ONLY') return 'SHORT (exit only)';
-  return sig;
-}
-function pnlCell(v){
+function pnlCell(v, pct){
   const tdEl=document.createElement('td');
   const b=document.createElement('span');
   b.className='status-badge';
   let num = (typeof v==='number') ? v : parseFloat(v||0) || 0;
-  b.textContent = Math.abs(num) >= 0.0001 ? num.toFixed(6) : num.toString();
+  let pctNum = (typeof pct==='number') ? pct : parseFloat(pct||0);
+  const txt = (isFinite(num) ? num.toFixed(2) : '') + (isFinite(pctNum) ? ` (${pctNum.toFixed(2)}%)` : '');
+  b.textContent = txt.trim();
   if(num > 0) b.classList.add('long');
   else if(num < 0) b.classList.add('short');
   else b.classList.add('waiting');
@@ -1485,19 +1473,32 @@ function pushRow(tb, w){
   const tr=document.createElement('tr');
   tr.appendChild(td(w.symbol));
   tr.appendChild(td(w.interval));
-  tr.appendChild(td(w.source||'')); 
-  tr.appendChild(td(w.leverage));
+  tr.appendChild(tdInt(w.leverage));         // целое число
   tr.appendChild(td(w.mode||'-'));
   tr.appendChild(td(w.midFilter?'ON':'OFF'));
-  tr.appendChild(td(sigText(w.lastSignal)));
   const stateCell = document.createElement('td'); stateCell.appendChild(stateBadge(w.botState)); tr.appendChild(stateCell);
-  tr.appendChild(td(w.availableUSDT));
-  tr.appendChild(td(w.netPos));
+
+  // Balance
+  tr.appendChild(tdMoney((w.balance!=null)?w.balance:w.availableUSDT));
+
+  // Position ($) — если есть lastPrice и netPos число
+  let posCell = document.createElement('td');
+  if(typeof w.netPos==='number' && typeof w.lastPrice==='number' && isFinite(w.lastPrice)){
+    const notional = w.netPos * w.lastPrice;
+    posCell.textContent = notional.toFixed(2);
+  } else {
+    // для External строк оставляем исходный текст
+    posCell.textContent = (w.netPos!=null)? String(w.netPos) : '';
+  }
+  tr.appendChild(posCell);
+
   tr.appendChild(td(w.entryPx));
   tr.appendChild(td(w.ema50));
   tr.appendChild(td(w.ema100));
   tr.appendChild(td(w.ema200));
-  tr.appendChild(pnlCell(w.pnlToday));
+
+  tr.appendChild(pnlCell(w.uPnL, w.uPnL_pct));
+
   tr.appendChild(td(w.lastAction||'')); 
   tr.appendChild(td(w.lastError||''));
   tb.appendChild(tr);
@@ -1563,7 +1564,7 @@ async def api_restart(req: Request):
     if not API_KEY or not API_SECRET:
         return JSONResponse({"error":"Missing BINANCE_API_KEY/SECRET"}, status_code=400)
     body = await req.json()
-    syms = body.get("symbols", [])  # пусто => auto-pick
+    syms = body.get("symbols", [])  # пусто => auto-пик
     interval = str(body.get("interval", DEFAULT_INTERVAL))
     leverage = int(body.get("leverage", DEFAULT_LEVERAGE))
     mid_filter = bool(body.get("mid_filter", False))
