@@ -936,7 +936,7 @@ class Manager:
         if self._valid_syms_cache and (now - self._valid_syms_cached_at_ms) < self._valid_syms_ttl_ms:
             return self._valid_syms_cache
         try:
-            r = await _get_with_backoff(self.http, f"{BINANCE_API}/fapi/v1/exchangeInfo"])
+            r = await _get_with_backoff(self.http, f"{BINANCE_API}/fapi/v1/exchangeInfo")
         except Exception:
             r = None
         try:
