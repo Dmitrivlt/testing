@@ -1436,7 +1436,8 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
     </div>
     <div>
       <label class="title">Leverage</label><br/>
-      <input id="lev" type="number" value="10" min="1" max="50" step="1"/>
+      <!-- Значение берём из бэкенда при загрузке/refresh -->
+      <input id="lev" type="number" value="1" min="1" max="50" step="1"/>
     </div>
     <div>
       <label class="title">Mode</label><br/>
@@ -1469,9 +1470,9 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
   <table class="table">
     <thead>
       <tr>
-        <!-- Убраны Source и Signal -->
+        <!-- Source и Signal скрыты -->
         <th>Symbol</th><th>TF</th><th>Lev</th><th>Mode</th><th>Mid</th><th>Bot</th>
-        <th>Avail USDT</th><th>Pos</th><th>Entry</th>
+        <th>Avail USDT</th><th>Equidity</th><th>Entry</th>
         <th>EMA50</th><th>EMA100</th><th>EMA200</th>
         <th>PnL Today (R)</th><th>Last Action</th><th>Error</th>
       </tr>
@@ -1522,40 +1523,30 @@ async function get(path){
   if(!r.ok) throw new Error(await r.text());
   return r.json();
 }
-async function start(){
-  try{ const p=params(); await post('/api/start',{symbols:symbols(), ...p}); await refresh(); }
-  catch(e){ alert('Start: '+e.message); }
-}
-async function stop(){
-  try{ await post('/api/stop',{}); await refresh(); }
-  catch(e){ alert('Stop: '+e.message); }
-}
-async function restart(){
-  try{ const p=params(); await post('/api/restart',{symbols:symbols(), ...p}); await refresh(); }
-  catch(e){ alert('Restart: '+e.message); }
-}
 
+// ---------- helpers ----------
 function td(v){
   const d=document.createElement('td');
   if(v==null) v='';
   if(typeof v==='number'){
-    // Общее форматирование чисел: 6 знаков для цен/EMA/PNL,
-    // но для маленьких чисел оставляем как есть
     d.textContent = Math.abs(v) >= 0.0001 ? v.toFixed(6) : v.toString();
   } else {
     d.textContent = v;
   }
   return d;
 }
-
-// Спец-ячейка для Leverage — всегда целое число
-function tdLev(v){
+function tdInt(v){
   const d=document.createElement('td');
-  const n = parseInt(v, 10);
-  d.textContent = isNaN(n) ? (v ?? "") : String(n);
+  const n = parseInt(v ?? 0);
+  d.textContent = isFinite(n) ? String(n) : '';
   return d;
 }
-
+function tdMoney(v){
+  const d=document.createElement('td');
+  const n = Number(v);
+  d.textContent = isFinite(n) ? n.toFixed(2) : '';
+  return d;
+}
 function stateBadge(state){
   const span=document.createElement('span');
   span.className='status-badge';
@@ -1564,7 +1555,6 @@ function stateBadge(state){
   else { span.classList.add('waiting'); span.textContent=state || 'Waiting'; }
   return span;
 }
-
 function pnlCell(v){
   const tdEl=document.createElement('td');
   const b=document.createElement('span');
@@ -1578,18 +1568,47 @@ function pnlCell(v){
   return tdEl;
 }
 
+// parse "L:0.1 / S:0.05"
+function parseLSPair(txt){
+  const res = {L:0, S:0};
+  if(typeof txt !== 'string') return res;
+  const mL = txt.match(/L:\s*([0-9.+-eE]+)/);
+  const mS = txt.match(/S:\s*([0-9.+-eE]+)/);
+  if(mL) res.L = parseFloat(mL[1]) || 0;
+  if(mS) res.S = parseFloat(mS[1]) || 0;
+  return res;
+}
+// compute equidity (USDT)
+function equidityUSDT(w){
+  try{
+    // external rows have string net/entry like "L:... / S:..."
+    if(w.source === 'external' || (typeof w.netPos === 'string')){
+      const q = parseLSPair(w.netPos || '');
+      const e = parseLSPair(w.entryPx || '');
+      const val = Math.abs(q.L)*(e.L||0) + Math.abs(q.S)*(e.S||0);
+      return val;
+    }else{
+      const qty = Math.abs(Number(w.netPos || 0));
+      const px  = Number(w.entryPx || 0);
+      return qty * px;
+    }
+  }catch(_){ return 0; }
+}
+
+function sigText(sig){ return ''; } // сигнал в UI не показываем
+
 function pushRow(tb, w){
   const tr=document.createElement('tr');
   tr.appendChild(td(w.symbol));
   tr.appendChild(td(w.interval));
-  tr.appendChild(tdLev(w.leverage));          // <-- целое число для Lev
+  tr.appendChild(tdInt(w.leverage));                  // Lev как целое
   tr.appendChild(td(w.mode||'-'));
   tr.appendChild(td(w.midFilter?'ON':'OFF'));
   const stateCell = document.createElement('td');
   stateCell.appendChild(stateBadge(w.botState));
   tr.appendChild(stateCell);
   tr.appendChild(td(w.availableUSDT));
-  tr.appendChild(td(w.netPos));
+  tr.appendChild(tdMoney(equidityUSDT(w)));           // Equidity (USDT)
   tr.appendChild(td(w.entryPx));
   tr.appendChild(td(w.ema50));
   tr.appendChild(td(w.ema100));
@@ -1602,14 +1621,39 @@ function pushRow(tb, w){
 
 async function refresh(){
   const st=await get('/api/status');
+
+  // sync header flag
   const flag=document.getElementById('flag');
   flag.textContent = st.running?'Running':'Stopped';
   flag.className = 'pill ' + (st.running?'on':'off');
+
+  // sync leverage input from backend (do not override while typing)
+  const levEl = document.getElementById('lev');
+  const backendLev = parseInt(st?.params?.leverage ?? 1);
+  if(document.activeElement !== levEl){
+    levEl.value = String(isFinite(backendLev) ? backendLev : 1);
+  }
+
+  // table
   const tb=document.getElementById('tbody');
   tb.innerHTML='';
   (st.workers||[]).forEach(w=> pushRow(tb, w));
   (st.external||[]).forEach(w=> pushRow(tb, w));
 }
+
+async function start(){
+  try{ const p=params(); await post('/api/start',{symbols:symbols(), ...p}); await refresh(); }
+  catch(e){ alert('Start: '+e.message); }
+}
+async function stop(){
+  try{ await post('/api/stop',{}); await refresh(); }
+  catch(e){ alert('Stop: '+e.message); }
+}
+async function restart(){
+  try{ const p=params(); await post('/api/restart',{symbols:symbols(), ...p}); await refresh(); }
+  catch(e){ alert('Restart: '+e.message); }
+}
+
 async function loop(){
   try{
     await refresh();
@@ -1625,6 +1669,7 @@ window.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ document.getEleme
 </script>
 </body></html>
 """
+
 HTML = HTML_TEMPLATE
 
 # ---------- FastAPI ----------
