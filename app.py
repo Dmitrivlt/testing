@@ -25,11 +25,13 @@ UTILIZATION = 1.00
 FEE_BUFFER_RATE = 0.001
 WARMUP_LIMIT = 1200
 
-# ВНИМАНИЕ: по умолчанию — подтверждение на закрытии бара (как в Pine)
-DEFAULT_ON_CLOSE_ONLY = True
+# Pine: confirmOnClose = false по умолчанию
+DEFAULT_ON_CLOSE_ONLY = False
+# Pine: oneSignalPerBar = true
+DEFAULT_ONE_SIGNAL_PER_BAR = True
+# Ты просил 1.0%; можно поменять в UI
+DEFAULT_SPREAD_MIN_PCT = 1.0
 
-# Эти поля оставлены для совместимости интерфейса/менеджера, но в сигнале не используются
-MID_GAP_THRESHOLD = float(os.getenv("MID_GAP_THRESHOLD", "0.01"))
 DEFAULT_MODE = "BOTH"
 AUTO_FALLBACK_SYMBOL = "CYBERUSDT"
 
@@ -44,11 +46,9 @@ def now_ms() -> int:
 
 # ---------- Helpers: price (только CLOSE) ----------
 def _kline_row_close(row: list) -> float:
-    # [0 openTime, 1 open, 2 high, 3 low, 4 close, ...]
     return float(row[4])
 
 def _kline_tick_close(k: dict) -> float:
-    # WS "k" payload has string fields, берём только close
     return float(k.get("c", 0.0))
 
 # ---------- Backoff helpers ----------
@@ -448,25 +448,27 @@ class SecAggregator:
         self.sec = s; self.o=self.h=self.l=self.c=price; self.v=qty
         return closed
 
-# ---------- EMA Cross Runner (как в Pine) ----------
+# ---------- EMA Cross Runner (pine-эквивалент) ----------
 class EMARunner:
-    def __init__(self, symbol: str, interval: str, leverage: int, mid_filter: bool, mode: str, on_close_only: bool, http: httpx.AsyncClient):
+    def __init__(self, symbol: str, interval: str, leverage: int,
+                 spread_min_pct: float, one_signal_per_bar: bool, on_close_only: bool,
+                 http: httpx.AsyncClient):
         self.symbol = symbol.upper()
         self.interval = interval
         self.target_leverage = max(1, min(leverage, LEVERAGE_CAP))
-        self.mid_filter = bool(mid_filter)  # оставлено, но не используется в сигнале
-        self.mode = "BOTH"  # режим не используется для сигналов кросса (как в Pine)
+        self.spread_min_pct = float(spread_min_pct)
+        self.one_signal_per_bar = bool(one_signal_per_bar)
         self.on_close_only = bool(on_close_only)
         self.http = http
 
         self.c = FuturesClient(self.symbol, http)
 
         self.closes: List[float] = []
-        self.ema50: Optional[float] = None    # значения EMA на ЗАКРЫТОМ баре
-        self.ema100: Optional[float] = None   # не участвует в логике, оставлено для UI
+        self.ema50: Optional[float] = None
+        self.ema100: Optional[float] = None
         self.ema200: Optional[float] = None
 
-        # для интрабар-калькуляции EMA (используем last_closed_ema как prev)
+        # интрабар EMA (эпемерные)
         self.alpha50 = 2.0/(50.0+1.0)
         self.alpha200 = 2.0/(200.0+1.0)
         self.prev_tick_ema50: Optional[float] = None
@@ -475,7 +477,7 @@ class EMARunner:
         self.running = False
         self._tasks: List[asyncio.Task] = []
 
-        # UI
+        # UI/status
         self.last_signal: Optional[str] = None
         self.last_action: Optional[str] = None
         self.last_action_ts: Optional[int] = None
@@ -483,11 +485,13 @@ class EMARunner:
         self.source: str = "kline"
         self.bot_state: str = "Waiting"
 
-        # одно событие на бар
+        # по-барный контроль
         self.last_bar_key: Optional[str] = None
-        self.fired_cross_this_bar: bool = False
+        self.fired_entry_this_bar: bool = False
 
-        # PnL today (realized only)
+        # pine-подобное pending: 1 / -1 / 0
+        self.pending: int = 0
+
         self.pnl_today_realized: float = 0.0
 
     # ---------- WARMUP ----------
@@ -498,7 +502,7 @@ class EMARunner:
                 params={"symbol": self.symbol, "interval": self.interval, "limit": WARMUP_LIMIT}
             )
             data = r.json()
-            closes = [_kline_row_close(x) for x in data]  # ТОЛЬКО close
+            closes = [_kline_row_close(x) for x in data]
             if not closes:
                 return
             self.closes = closes
@@ -519,107 +523,50 @@ class EMARunner:
             )
         except Exception as e:
             self.last_error = f"warmup_1s: {e}"
-            return
-        trades = r.json()
-        aggr: Dict[int, Dict[str, float]] = {}
-        for t in trades:
-            ts = int(t["T"]) // 1000
-            p = float(t["p"])
-            q = float(t["q"])
-            if ts not in aggr:
-                aggr[ts] = {"o": p, "h": p, "l": p, "c": p, "v": q}
-            else:
-                aggr[ts]["h"] = max(aggr[ts]["h"], p)
-                aggr[ts]["l"] = min(aggr[ts]["l"], p)
-                aggr[ts]["c"] = p
-                aggr[ts]["v"] += q
-        if not aggr:
-            return
-        closes = [aggr[s]["c"] for s in sorted(aggr.keys())]
-        self.closes = closes
-        e50  = tv_ema_series(closes, 50)
-        e100 = tv_ema_series(closes, 100)
-        e200 = tv_ema_series(closes, 200)
-        self.ema50  = e50[-1]
-        self.ema100 = e100[-1]
-        self.ema200 = e200[-1]
+        else:
+            trades = r.json()
+            aggr: Dict[int, Dict[str, float]] = {}
+            for t in trades:
+                ts = int(t["T"]) // 1000
+                p = float(t["p"])
+                q = float(t["q"])
+                if ts not in aggr:
+                    aggr[ts] = {"o": p, "h": p, "l": p, "c": p, "v": q}
+                else:
+                    aggr[ts]["h"] = max(aggr[ts]["h"], p)
+                    aggr[ts]["l"] = min(aggr[ts]["l"], p)
+                    aggr[ts]["c"] = p
+                    aggr[ts]["v"] += q
+            if not aggr:
+                return
+            closes = [aggr[s]["c"] for s in sorted(aggr.keys())]
+            self.closes = closes
+            e50  = tv_ema_series(closes, 50)
+            e100 = tv_ema_series(closes, 100)
+            e200 = tv_ema_series(closes, 200)
+            self.ema50  = e50[-1]
+            self.ema100 = e100[-1]
+            self.ema200 = e200[-1]
 
-    # ---------- Обновление EMA на закрытии бара ----------
+    # ---------- закрытие бара ----------
     async def _on_bar_close(self, close_price: float, bar_key: str):
-        # обновляем закрытые EMA
         self.closes.append(close_price)
         if len(self.closes) > WARMUP_LIMIT:
             self.closes = self.closes[-WARMUP_LIMIT:]
 
-        if self.ema50 is None:
-            self.ema50 = tv_ema_series(self.closes, 50)[-1]
-        else:
-            self.ema50 = tv_ema_next(self.ema50, close_price, 50)
-
-        if self.ema100 is None:
-            self.ema100 = tv_ema_series(self.closes, 100)[-1]
-        else:
-            self.ema100 = tv_ema_next(self.ema100, close_price, 100)
-
-        if self.ema200 is None:
-            self.ema200 = tv_ema_series(self.closes, 200)[-1]
-        else:
-            self.ema200 = tv_ema_next(self.ema200, close_price, 200)
+        self.ema50  = tv_ema_next(self.ema50,  close_price, 50)  if self.ema50  is not None else tv_ema_series(self.closes, 50)[-1]
+        self.ema100 = tv_ema_next(self.ema100, close_price, 100) if self.ema100 is not None else tv_ema_series(self.closes,100)[-1]
+        self.ema200 = tv_ema_next(self.ema200, close_price, 200) if self.ema200 is not None else tv_ema_series(self.closes,200)[-1]
 
         self.last_bar_key = bar_key
-        self.fired_cross_this_bar = False
-        # сбрасываем интрабарные EMA (новый бар = новая «эфемерная» EMA)
+        self.fired_entry_this_bar = False
         self.prev_tick_ema50 = None
         self.prev_tick_ema200 = None
 
-    # ---------- Интрабар кросс EMA↔EMA (как в Pine при confirmOff) ----------
-    def _intrabar_cross_signal(self, price: float, bar_key: str) -> Optional[str]:
-        if self.ema50 is None or self.ema200 is None:
-            return None
-
-        # ephemeral EMA на текущем тике: prev = закрытая EMA предыдущего бара
-        ema50_now = self.alpha50*price + (1.0 - self.alpha50)*self.ema50
-        ema200_now = self.alpha200*price + (1.0 - self.alpha200)*self.ema200
-
-        # первый тик бара — запоминаем и выходим
-        if self.prev_tick_ema50 is None or self.prev_tick_ema200 is None:
-            self.prev_tick_ema50 = ema50_now
-            self.prev_tick_ema200 = ema200_now
-            return None
-
-        # та же логика, что у crossover/crossunder: сравниваем «до» и «после»
-        long_cross  = (self.prev_tick_ema50 <= self.prev_tick_ema200) and (ema50_now > ema200_now)
-        short_cross = (self.prev_tick_ema50 >= self.prev_tick_ema200) and (ema50_now < ema200_now)
-
-        # обновляем «предыдущие» на следующий тик
-        self.prev_tick_ema50 = ema50_now
-        self.prev_tick_ema200 = ema200_now
-
-        if long_cross:
-            return "LONG"
-        if short_cross:
-            return "SHORT"
-        return None
-
-    # ---------- Локальный статус ----------
-    def _refresh_state_nowait(self):
-        try:
-            min_qty = max(self.c.min_qty, 0.0)
-            if self.c.dual_side:
-                if self.c.long_pos > min_qty:
-                    self.bot_state = "LONG"
-                elif self.c.short_pos > min_qty:
-                    self.bot_state = "SHORT"
-                else:
-                    self.bot_state = "Waiting"
-            else:
-                pos = self.c.net_pos
-                self.bot_state = "Waiting" if abs(pos) < 1e-12 else ("LONG" if pos > 0 else "SHORT")
-        except Exception:
-            self.bot_state = "Waiting"
-
-    # ---------- ДЕЙСТВИЯ ПО СИГНАЛУ (flip) ----------
+    # ---------- действие по сигналу ----------
     async def _act_on_signal(self, sig: Optional[str], ref_price: float):
+        if not sig:
+            return
         try:
             await self.c.fetch_account()
             await self.c.ensure_leverage(self.target_leverage)
@@ -633,12 +580,9 @@ class EMARunner:
                         await self.c.fetch_account()
                         if err: self.last_action = f"EXIT SHORT FAILED ({err})"; self.last_action_ts = now_ms(); return
                     await asyncio.sleep(0.25)
-                    await self.c.fetch_account()
                     _, err = await self.c.place_market_smart("BUY", ref_price, reduce_only=False, position_side="LONG")
                     await self.c.fetch_account()
                     self.last_action = "ENTER LONG ok" if err is None and self.c.long_pos > min_qty else f"ENTER LONG FAILED ({err})"
-                    self.last_action_ts = now_ms()
-
                 elif sig == "SHORT":
                     if self.c.long_pos > min_qty:
                         q = self.c._round_qty_floor(self.c.long_pos)
@@ -646,12 +590,9 @@ class EMARunner:
                         await self.c.fetch_account()
                         if err: self.last_action = f"EXIT LONG FAILED ({err})"; self.last_action_ts = now_ms(); return
                     await asyncio.sleep(0.25)
-                    await self.c.fetch_account()
                     _, err = await self.c.place_market_smart("SELL", ref_price, reduce_only=False, position_side="SHORT")
                     await self.c.fetch_account()
                     self.last_action = "ENTER SHORT ok" if err is None and self.c.short_pos > min_qty else f"ENTER SHORT FAILED ({err})"
-                    self.last_action_ts = now_ms()
-
             else:
                 pos = self.c.net_pos
                 if sig == "LONG":
@@ -661,12 +602,9 @@ class EMARunner:
                         await self.c.fetch_account()
                         if err: self.last_action = f"EXIT SHORT FAILED ({err})"; self.last_action_ts = now_ms(); return
                     await asyncio.sleep(0.25)
-                    await self.c.fetch_account()
                     _, err = await self.c.place_market_smart("BUY", ref_price, reduce_only=False)
                     await self.c.fetch_account()
                     self.last_action = "ENTER LONG ok" if err is None and self.c.net_pos > min_qty else f"ENTER LONG FAILED ({err})"
-                    self.last_action_ts = now_ms()
-
                 elif sig == "SHORT":
                     if pos > min_qty:
                         q = self.c._round_qty_floor(abs(pos))
@@ -674,17 +612,31 @@ class EMARunner:
                         await self.c.fetch_account()
                         if err: self.last_action = f"EXIT LONG FAILED ({err})"; self.last_action_ts = now_ms(); return
                     await asyncio.sleep(0.25)
-                    await self.c.fetch_account()
                     _, err = await self.c.place_market_smart("SELL", ref_price, reduce_only=False)
                     await self.c.fetch_account()
                     self.last_action = "ENTER SHORT ok" if err is None and self.c.net_pos < -min_qty else f"ENTER SHORT FAILED ({err})"
-                    self.last_action_ts = now_ms()
 
+            self.last_action_ts = now_ms()
+            self.last_signal = sig
             await self.c.fetch_account()
             self._refresh_state_nowait()
         except Exception as e:
             self.last_error = f"act: {e}"
 
+    def _refresh_state_nowait(self):
+        try:
+            min_qty = max(self.c.min_qty, 0.0)
+            if self.c.dual_side:
+                if self.c.long_pos > min_qty:  self.bot_state = "LONG"
+                elif self.c.short_pos > min_qty: self.bot_state = "SHORT"
+                else: self.bot_state = "Waiting"
+            else:
+                pos = self.c.net_pos
+                self.bot_state = "Waiting" if abs(pos) < 1e-12 else ("LONG" if pos > 0 else "SHORT")
+        except Exception:
+            self.bot_state = "Waiting"
+
+    # ---------- WebSocket loops ----------
     async def _time_sync_loop(self):
         while self.running:
             await self.c.sync_time()
@@ -697,52 +649,75 @@ class EMARunner:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                     async for raw in ws:
-                        if not self.running:
-                            break
+                        if not self.running: break
                         try:
                             e = json.loads(raw)
                             k = e.get("k") or {}
-                            px = _kline_tick_close(k)             # ТОЛЬКО close
+                            px = _kline_tick_close(k)
                             is_closed = bool(k.get("x", False))
                             bar_key = f"{k.get('t')}_{k.get('T')}"
 
-                            if not is_closed:
-                                # новый бар? (первый апдейт внутри бара)
-                                if bar_key != self.last_bar_key:
-                                    self.last_bar_key = bar_key
-                                    self.fired_cross_this_bar = False
-                                    self.prev_tick_ema50 = None
-                                    self.prev_tick_ema200 = None
+                            # новый бар?
+                            if bar_key != self.last_bar_key:
+                                self.last_bar_key = bar_key
+                                self.fired_entry_this_bar = False
+                                self.prev_tick_ema50 = None
+                                self.prev_tick_ema200 = None
 
-                                if not self.on_close_only and not self.fired_cross_this_bar:
-                                    sig = self._intrabar_cross_signal(px, bar_key)
-                                    self.last_signal = sig
-                                    if sig:
-                                        await self._act_on_signal(sig, px)
-                                        self.fired_cross_this_bar = True
+                            if not is_closed:
+                                # интрабар логика допускается только если confirmOff
+                                if not self.on_close_only and (self.ema50 is not None) and (self.ema200 is not None):
+                                    ema50_now  = self.alpha50*px  + (1.0 - self.alpha50)*self.ema50
+                                    ema200_now = self.alpha200*px + (1.0 - self.alpha200)*self.ema200
+
+                                    if (self.prev_tick_ema50 is not None) and (self.prev_tick_ema200 is not None):
+                                        long_cross  = (self.prev_tick_ema50 <= self.prev_tick_ema200) and (ema50_now > ema200_now)
+                                        short_cross = (self.prev_tick_ema50 >= self.prev_tick_ema200) and (ema50_now < ema200_now)
+                                        if long_cross:  self.pending = 1
+                                        elif short_cross: self.pending = -1
+
+                                        denom = max(abs(ema200_now), 1e-12)
+                                        spread_now = abs(ema50_now - ema200_now) / denom * 100.0
+                                        can_fire = (not self.one_signal_per_bar) or (not self.fired_entry_this_bar)
+                                        if can_fire and self.pending == 1 and spread_now >= self.spread_min_pct:
+                                            await self._act_on_signal("LONG", px)
+                                            self.pending = 0
+                                            self.fired_entry_this_bar = True
+                                        elif can_fire and self.pending == -1 and spread_now >= self.spread_min_pct:
+                                            await self._act_on_signal("SHORT", px)
+                                            self.pending = 0
+                                            self.fired_entry_this_bar = True
+
+                                    self.prev_tick_ema50 = ema50_now
+                                    self.prev_tick_ema200 = ema200_now
                                 continue
 
-                            # бар закрылся -> проверяем кросс между закрытыми EMA
-                            prev50 = self.ema50
+                            # --- бар закрывается: считаем кросс и спред на закрытии ---
+                            prev50  = self.ema50
                             prev200 = self.ema200
-                            next50 = tv_ema_next(prev50, px, 50) if prev50 is not None else None
+                            next50  = tv_ema_next(prev50, px, 50)  if prev50  is not None else None
                             next200 = tv_ema_next(prev200, px, 200) if prev200 is not None else None
 
-                            sig_close = None
-                            if prev50 is not None and prev200 is not None and next50 is not None and next200 is not None:
+                            if (prev50 is not None) and (prev200 is not None) and (next50 is not None) and (next200 is not None):
                                 long_cross  = (prev50 <= prev200) and (next50 > next200)
                                 short_cross = (prev50 >= prev200) and (next50 < next200)
-                                if long_cross: sig_close = "LONG"
-                                elif short_cross: sig_close = "SHORT"
+                                if long_cross:  self.pending = 1
+                                elif short_cross: self.pending = -1
 
-                            # сначала обновим EMA и сбросим бар-флаги
+                                denom = max(abs(next200), 1e-12)
+                                spread_close = abs(next50 - next200) / denom * 100.0
+                                can_fire = (not self.one_signal_per_bar) or (not self.fired_entry_this_bar)
+                                if can_fire and self.pending == 1 and spread_close >= self.spread_min_pct:
+                                    await self._act_on_signal("LONG", px)
+                                    self.pending = 0
+                                    self.fired_entry_this_bar = True
+                                elif can_fire and self.pending == -1 and spread_close >= self.spread_min_pct:
+                                    await self._act_on_signal("SHORT", px)
+                                    self.pending = 0
+                                    self.fired_entry_this_bar = True
+
+                            # обновляем закрытые EMA и сбрасываем интрабарные
                             await self._on_bar_close(px, bar_key)
-
-                            # если требуется подтверждение на закрытии — действуем здесь
-                            if self.on_close_only and sig_close and not self.fired_cross_this_bar:
-                                self.last_signal = sig_close
-                                await self._act_on_signal(sig_close, px)
-                                self.fired_cross_this_bar = True
 
                         except Exception as ex:
                             self.last_error = f"kline parse: {ex}"
@@ -758,8 +733,7 @@ class EMARunner:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                     async for raw in ws:
-                        if not self.running:
-                            break
+                        if not self.running: break
                         try:
                             e = json.loads(raw)
                             p = float(e["p"]); q = float(e["q"]); ts = int(e["T"])
@@ -767,20 +741,31 @@ class EMARunner:
                             if closed:
                                 c = float(closed["c"])
                                 bar_key = str(int(closed["t"]))
-                                # для 1s источника у нас по факту нет интрабара — только закрытие секунды
-                                prev50 = self.ema50
+
+                                prev50  = self.ema50
                                 prev200 = self.ema200
-                                next50 = tv_ema_next(prev50, c, 50) if prev50 is not None else None
+                                next50  = tv_ema_next(prev50, c, 50)  if prev50  is not None else None
                                 next200 = tv_ema_next(prev200, c, 200) if prev200 is not None else None
-                                sig_close = None
-                                if prev50 is not None and prev200 is not None and next50 is not None and next200 is not None:
-                                    if (prev50 <= prev200) and (next50 > next200): sig_close = "LONG"
-                                    elif (prev50 >= prev200) and (next50 < next200): sig_close = "SHORT"
+
+                                if (prev50 is not None) and (prev200 is not None) and (next50 is not None) and (next200 is not None):
+                                    long_cross  = (prev50 <= prev200) and (next50 > next200)
+                                    short_cross = (prev50 >= prev200) and (next50 < next200)
+                                    if long_cross:  self.pending = 1
+                                    elif short_cross: self.pending = -1
+
+                                    denom = max(abs(next200), 1e-12)
+                                    spread_close = abs(next50 - next200) / denom * 100.0
+                                    can_fire = (not self.one_signal_per_bar) or (not self.fired_entry_this_bar)
+                                    if can_fire and self.pending == 1 and spread_close >= self.spread_min_pct:
+                                        await self._act_on_signal("LONG", c)
+                                        self.pending = 0
+                                        self.fired_entry_this_bar = True
+                                    elif can_fire and self.pending == -1 and spread_close >= self.spread_min_pct:
+                                        await self._act_on_signal("SHORT", c)
+                                        self.pending = 0
+                                        self.fired_entry_this_bar = True
 
                                 await self._on_bar_close(c, bar_key)
-                                if sig_close:
-                                    self.last_signal = sig_close
-                                    await self._act_on_signal(sig_close, c)
                         except Exception as ex:
                             self.last_error = f"agg parse: {ex}"
             except Exception as ex:
@@ -828,9 +813,9 @@ class EMARunner:
             "ema50": self.ema50,
             "ema100": self.ema100,
             "ema200": self.ema200,
-            "midFilter": self.mid_filter,
-            "mode": self.mode,
             "onCloseOnly": self.on_close_only,
+            "oneSignalPerBar": self.one_signal_per_bar,
+            "spreadMinPct": self.spread_min_pct,
             "botState": self.bot_state,
             "lastSignal": self.last_signal,
             "lastAction": self.last_action,
@@ -850,9 +835,9 @@ class Manager:
 
         self.cur_interval = DEFAULT_INTERVAL
         self.cur_leverage = DEFAULT_LEVERAGE
-        self.cur_mid_filter = False
-        self.cur_mode = DEFAULT_MODE
         self.cur_on_close_only = DEFAULT_ON_CLOSE_ONLY
+        self.cur_one_signal_per_bar = DEFAULT_ONE_SIGNAL_PER_BAR
+        self.cur_spread_min_pct = DEFAULT_SPREAD_MIN_PCT
 
         self._tasks: List[asyncio.Task] = []
 
@@ -865,7 +850,7 @@ class Manager:
         self.auto_current_symbol: Optional[str] = None
         self.auto_current_pct: Optional[float] = None
 
-        # --- КЭШ валидных USDT-M PERPETUAL символов
+        # --- кэш USDT-M PERP
         self._valid_syms_cache: set[str] = set()
         self._valid_syms_cached_at_ms: int = 0
         self._valid_syms_ttl_ms: int = 5 * 60 * 1000
@@ -916,7 +901,8 @@ class Manager:
             pass
         return (AUTO_FALLBACK_SYMBOL, 0.0)
 
-    async def start(self, symbols: List[str], interval: str, leverage: int, mid_filter: bool, mode: str, on_close_only: bool):
+    async def start(self, symbols: List[str], interval: str, leverage: int,
+                    spread_min_pct: float, one_signal_per_bar: bool, on_close_only: bool):
         if self.running:
             await self.stop()
         if interval not in ALL_INTERVALS:
@@ -924,8 +910,8 @@ class Manager:
 
         self.cur_interval = interval
         self.cur_leverage = max(1, min(int(leverage), LEVERAGE_CAP))
-        self.cur_mid_filter = bool(mid_filter)
-        self.cur_mode = DEFAULT_MODE
+        self.cur_spread_min_pct = float(spread_min_pct)
+        self.cur_one_signal_per_bar = bool(one_signal_per_bar)
         self.cur_on_close_only = bool(on_close_only)
 
         syms_clean = [s.strip().upper() for s in (symbols or []) if s and s.strip()]
@@ -941,7 +927,9 @@ class Manager:
 
         self.runners.clear()
         for s in syms_clean:
-            r = EMARunner(s, self.cur_interval, self.cur_leverage, self.cur_mid_filter, self.cur_mode, self.cur_on_close_only, self.http)
+            r = EMARunner(s, self.cur_interval, self.cur_leverage,
+                          self.cur_spread_min_pct, self.cur_one_signal_per_bar, self.cur_on_close_only,
+                          self.http)
             self.runners[s] = r
             try:
                 await r.run()
@@ -960,18 +948,12 @@ class Manager:
                 if r.c.dual_side:
                     if r.c.long_pos > r.c.min_qty:
                         q = r.c._round_qty_floor(r.c.long_pos)
-                        await r.c.place_market_smart(
-                            "SELL",
-                            r.c.entry_px or (await r.c.fetch_last_price() or 0.0),
-                            reduce_only=True, position_side="LONG", qty_override=q
-                        )
+                        await r.c.place_market_smart("SELL", r.c.entry_px or (await r.c.fetch_last_price() or 0.0),
+                                                     reduce_only=True, position_side="LONG", qty_override=q)
                     if r.c.short_pos > r.c.min_qty:
                         q = r.c._round_qty_floor(r.c.short_pos)
-                        await r.c.place_market_smart(
-                            "BUY",
-                            r.c.entry_px or (await r.c.fetch_last_price() or 0.0),
-                            reduce_only=True, position_side="SHORT", qty_override=q
-                        )
+                        await r.c.place_market_smart("BUY", r.c.entry_px or (await r.c.fetch_last_price() or 0.0),
+                                                     reduce_only=True, position_side="SHORT", qty_override=q)
                 else:
                     pos = r.c.net_pos
                     if abs(pos) >= max(r.c.min_qty, 0):
@@ -993,9 +975,10 @@ class Manager:
             t.cancel()
         self._tasks.clear()
 
-    async def restart(self, symbols: List[str], interval: str, leverage: int, mid_filter: bool, mode: str, on_close_only: bool):
+    async def restart(self, symbols: List[str], interval: str, leverage: int,
+                      spread_min_pct: float, one_signal_per_bar: bool, on_close_only: bool):
         await self.stop()
-        await self.start(symbols, interval, leverage, mid_filter, mode, on_close_only)
+        await self.start(symbols, interval, leverage, spread_min_pct, one_signal_per_bar, on_close_only)
 
     async def _income_loop(self):
         while self.running:
@@ -1048,7 +1031,8 @@ class Manager:
             try:
                 ts = now_ms() + TIME_DRIFT_MS
                 try:
-                    rds = await _signed_get_with_backoff(self.http, f"{BINANCE_API}/fapi/v1/positionSide/dual", params={"timestamp": ts, "recvWindow": 5000})
+                    rds = await _signed_get_with_backoff(self.http, f"{BINANCE_API}/fapi/v1/positionSide/dual",
+                                                         params={"timestamp": ts, "recvWindow": 5000})
                     self.dual_side = bool(rds.json().get("dualSidePosition", False))
                 except Exception:
                     pass
@@ -1096,7 +1080,8 @@ class Manager:
                         entry_text = f"{d['entry']:.6f}"
                     ext[sym] = {
                         "symbol": sym, "interval": self.cur_interval, "source": "external", "leverage": self.cur_leverage,
-                        "mode": "-", "midFilter": False, "lastSignal": None, "botState": state, "availableUSDT": avail_usdt,
+                        "onCloseOnly": self.cur_on_close_only, "oneSignalPerBar": self.cur_one_signal_per_bar, "spreadMinPct": self.cur_spread_min_pct,
+                        "lastSignal": None, "botState": state, "availableUSDT": avail_usdt,
                         "netPos": pos_text, "entryPx": entry_text, "ema50": None, "ema100": None, "ema200": None,
                         "pnlToday": 0.0, "lastAction": "External position", "lastError": None
                     }
@@ -1133,7 +1118,8 @@ class Manager:
                     if not any_open:
                         top_sym, top_pct = await self.pick_top1_symbol()
                         if top_sym and (top_sym not in self.runners):
-                            await self.restart([top_sym], self.cur_interval, self.cur_leverage, self.cur_mid_filter, self.cur_mode, self.cur_on_close_only)
+                            await self.restart([top_sym], self.cur_interval, self.cur_leverage,
+                                               self.cur_spread_min_pct, self.cur_one_signal_per_bar, self.cur_on_close_only)
                             self.auto_pick = True
                             self.auto_current_symbol = top_sym
                             self.auto_current_pct = top_pct
@@ -1151,9 +1137,9 @@ class Manager:
             "params": {
                 "interval": self.cur_interval,
                 "leverage": self.cur_leverage,
-                "mid_filter": self.cur_mid_filter,
-                "mode": self.cur_mode,
-                "on_close_only": self.cur_on_close_only
+                "on_close_only": self.cur_on_close_only,
+                "one_signal_per_bar": self.cur_one_signal_per_bar,
+                "spread_min_pct": self.cur_spread_min_pct
             },
             "workers": [r.status() for r in self.runners.values()],
             "external": list(self.external.values()),
@@ -1166,12 +1152,12 @@ class Manager:
 
 MANAGER = Manager()
 
-# ---------- UI (без изменений логики отображения) ----------
+# ---------- UI ----------
 TF_OPTIONS = "".join([f"<option{' selected' if tf==DEFAULT_INTERVAL else ''}>{tf}</option>" for tf in ALL_INTERVALS])
 
 HTML_TEMPLATE = """
 <!doctype html><html><head><meta charset="utf-8"/>
-<title>EMA Touch — Binance Futures</title>
+<title>EMA Cross + Spread — Binance Futures</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
 :root { --bg:#0f172a; --card:#111827; --muted:#94a3b8; --text:#e5e7eb; --border:#1f2937; --green:#22c55e; --red:#ef4444; --blue:#3b82f6; --amber:#f59e0b; --gray:#6b7280; }
@@ -1198,7 +1184,7 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
 .waiting { background:#1f2937; color:#cbd5e1; }
 .long { background:rgba(34,197,94,.2); color:#86efac; }
 .short { background:rgba(239,68,68,.2); color:#fca5a5; }
-/* iOS-style switches */
+/* switches */
 .switch { position:relative; width:54px; height:30px; background:#374151; border-radius:999px; transition:background .2s ease; border:1px solid #4b5563; cursor:pointer; }
 .switch input { display:none; }
 .switch .thumb { position:absolute; top:3px; left:3px; width:24px; height:24px; background:#fff; border-radius:50%; transition:left .2s ease; box-shadow: 0 2px 8px rgba(0,0,0,.35); }
@@ -1212,13 +1198,13 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
 </head>
 <body>
 <div class="container">
-<h2>EMA Touch — Binance Futures</h2>
+<h2>EMA Cross + Spread — Binance Futures</h2>
 <div class="card">
   <div class="grid">
     <div>
       <label class="title">Symbols (comma)</label><br/>
       <input id="sym" type="text" value="" placeholder="choose a coin"/>
-      <div class="small">Оставь пустым — бот выберет Топ-1 24h % автоматически (USDT-M PERP). Фолбэк: CYBERUSDT.</div>
+      <div class="small">Пусто — авто выбор топ-1 24h% (USDT-M PERP). Фолбэк: CYBERUSDT.</div>
     </div>
     <div>
       <label class="title">Timeframe</label><br/>
@@ -1226,24 +1212,20 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
     </div>
     <div>
       <label class="title">Leverage</label><br/>
-      <!-- Значение берём из бэкенда при загрузке/refresh -->
       <input id="lev" type="number" value="1" min="1" max="50" step="1"/>
     </div>
     <div>
-      <label class="title">Mode</label><br/>
-      <select id="mode">
-        <option selected>Both</option>
-        <option>Long only</option>
-      </select>
+      <label class="title">Min EMA spread (%)</label><br/>
+      <input id="spread" type="number" value="1.00" min="0" step="0.05"/>
     </div>
     <div>
-      <label class="title">Mid filter</label><br/>
-      <div id="mid" class="switch"><input type="checkbox"/><div class="thumb"></div></div>
+      <label class="title">Confirm on bar close</label><br/>
+      <div id="confirm" class="switch"><input type="checkbox"/><div class="thumb"></div></div>
+      <div class="small">OFF = интрабар (как в pine при calc_on_every_tick).</div>
     </div>
     <div>
-      <label class="title">Signal: Close-only</label><br/>
-      <div id="closeonly" class="switch"><input type="checkbox"/><div class="thumb"></div></div>
-      <div class="small">OFF = Touch (intrabar)</div>
+      <label class="title">One signal per bar</label><br/>
+      <div id="onesig" class="switch on"><input type="checkbox"/><div class="thumb"></div></div>
     </div>
   </div>
   <div class="row" style="margin-top:12px;">
@@ -1260,9 +1242,9 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
   <table class="table">
     <thead>
       <tr>
-        <!-- Source и Signal скрыты -->
-        <th>Symbol</th><th>TF</th><th>Lev</th><th>Mode</th><th>Mid</th><th>Bot</th>
-        <th>Avail USDT</th><th>Equidity</th><th>Entry</th>
+        <th>Symbol</th><th>TF</th><th>Lev</th>
+        <th>ConfirmClose</th><th>1/Bar</th><th>Spread %</th>
+        <th>Bot</th><th>Avail USDT</th><th>Equidity</th><th>Entry</th>
         <th>EMA50</th><th>EMA100</th><th>EMA200</th>
         <th>PnL Today (R)</th><th>Last Action</th><th>Error</th>
       </tr>
@@ -1270,33 +1252,32 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
     <tbody id="tbody"></tbody>
   </table>
   <div class="small" style="margin-top:8px;">
-    Реализованный PnL считается за календарные сутки UTC. Положительный — зелёный, отрицательный — красный.
+    Реализованный PnL считается за сутки UTC.
   </div>
 </div>
 </div>
 
 <script>
-function toggleInit(id){
+function toggleInit(id, initialOn=false){
   const el=document.getElementById(id);
+  if(initialOn) el.classList.add('on');
   el.addEventListener('click', ()=>{ el.classList.toggle('on'); });
   return el;
 }
-const mid = toggleInit('mid');
-const closeonly = toggleInit('closeonly');
+const confirmSw = toggleInit('confirm', false);
+const onesigSw  = toggleInit('onesig',  true);
 
 function symbols(){
   return document.getElementById('sym').value
-    .split(',')
-    .map(s=>s.trim())
-    .filter(Boolean); // если пусто — [] => авто-пик на сервере
+    .split(',').map(s=>s.trim()).filter(Boolean);
 }
 function params(){
   return {
     interval: document.getElementById('tf').value,
     leverage: parseInt(document.getElementById('lev').value),
-    mid_filter: mid.classList.contains('on'),
-    on_close_only: closeonly.classList.contains('on'),
-    mode: document.getElementById('mode').value
+    spread_min_pct: parseFloat(document.getElementById('spread').value),
+    one_signal_per_bar: onesigSw.classList.contains('on'),
+    on_close_only: confirmSw.classList.contains('on')
   };
 }
 async function post(path, body){
@@ -1320,9 +1301,7 @@ function td(v){
   if(v==null) v='';
   if(typeof v==='number'){
     d.textContent = Math.abs(v) >= 0.0001 ? v.toFixed(6) : v.toString();
-  } else {
-    d.textContent = v;
-  }
+  } else { d.textContent = v; }
   return d;
 }
 function tdInt(v){
@@ -1357,8 +1336,6 @@ function pnlCell(v){
   tdEl.appendChild(b);
   return tdEl;
 }
-
-// parse "L:0.1 / S:0.05"
 function parseLSPair(txt){
   const res = {L:0, S:0};
   if(typeof txt !== 'string') return res;
@@ -1368,10 +1345,8 @@ function parseLSPair(txt){
   if(mS) res.S = parseFloat(mS[1]) || 0;
   return res;
 }
-// compute equidity (USDT)
 function equidityUSDT(w){
   try{
-    // external rows have string net/entry like "L:... / S:..."
     if(w.source === 'external' || (typeof w.netPos === 'string')){
       const q = parseLSPair(w.netPos || '');
       const e = parseLSPair(w.entryPx || '');
@@ -1385,20 +1360,19 @@ function equidityUSDT(w){
   }catch(_){ return 0; }
 }
 
-function sigText(sig){ return ''; } // сигнал в UI не показываем
-
 function pushRow(tb, w){
   const tr=document.createElement('tr');
   tr.appendChild(td(w.symbol));
   tr.appendChild(td(w.interval));
-  tr.appendChild(tdInt(w.leverage));                  // Lev как целое
-  tr.appendChild(td(w.mode||'-'));
-  tr.appendChild(td(w.midFilter?'ON':'OFF'));
+  tr.appendChild(tdInt(w.leverage));
+  tr.appendChild(td(w.onCloseOnly ? 'ON' : 'OFF'));
+  tr.appendChild(td(w.oneSignalPerBar ? 'ON' : 'OFF'));
+  tr.appendChild(td(Number(w.spreadMinPct).toFixed(2)));
   const stateCell = document.createElement('td');
   stateCell.appendChild(stateBadge(w.botState));
   tr.appendChild(stateCell);
   tr.appendChild(td(w.availableUSDT));
-  tr.appendChild(tdMoney(equidityUSDT(w)));           // Equidity (USDT)
+  tr.appendChild(tdMoney(equidityUSDT(w)));
   tr.appendChild(td(w.entryPx));
   tr.appendChild(td(w.ema50));
   tr.appendChild(td(w.ema100));
@@ -1411,20 +1385,26 @@ function pushRow(tb, w){
 
 async function refresh(){
   const st=await get('/api/status');
-
-  // sync header flag
   const flag=document.getElementById('flag');
   flag.textContent = st.running?'Running':'Stopped';
   flag.className = 'pill ' + (st.running?'on':'off');
 
-  // sync leverage input from backend (do not override while typing)
   const levEl = document.getElementById('lev');
   const backendLev = parseInt(st?.params?.leverage ?? 1);
   if(document.activeElement !== levEl){
     levEl.value = String(isFinite(backendLev) ? backendLev : 1);
   }
+  const spreadEl = document.getElementById('spread');
+  const beSpread = Number(st?.params?.spread_min_pct ?? 1.0);
+  if(document.activeElement !== spreadEl){
+    spreadEl.value = isFinite(beSpread) ? beSpread.toFixed(2) : '1.00';
+  }
 
-  // table
+  if(st?.params){
+    if(st.params.on_close_only) document.getElementById('confirm').classList.add('on'); else document.getElementById('confirm').classList.remove('on');
+    if(st.params.one_signal_per_bar) document.getElementById('onesig').classList.add('on'); else document.getElementById('onesig').classList.remove('on');
+  }
+
   const tb=document.getElementById('tbody');
   tb.innerHTML='';
   (st.workers||[]).forEach(w=> pushRow(tb, w));
@@ -1484,11 +1464,11 @@ async def api_start(req: Request):
     syms = body.get("symbols", [])
     interval = str(body.get("interval", DEFAULT_INTERVAL))
     leverage = int(body.get("leverage", DEFAULT_LEVERAGE))
-    mid_filter = bool(body.get("mid_filter", False))
-    mode = str(body.get("mode", DEFAULT_MODE))
+    spread_min_pct = float(body.get("spread_min_pct", DEFAULT_SPREAD_MIN_PCT))
+    one_signal_per_bar = bool(body.get("one_signal_per_bar", DEFAULT_ONE_SIGNAL_PER_BAR))
     on_close_only = bool(body.get("on_close_only", DEFAULT_ON_CLOSE_ONLY))
     try:
-        await MANAGER.start(syms, interval, leverage, mid_filter, mode, on_close_only)
+        await MANAGER.start(syms, interval, leverage, spread_min_pct, one_signal_per_bar, on_close_only)
         return JSONResponse({"ok": True})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -1506,11 +1486,11 @@ async def api_restart(req: Request):
     syms = body.get("symbols", [])
     interval = str(body.get("interval", DEFAULT_INTERVAL))
     leverage = int(body.get("leverage", DEFAULT_LEVERAGE))
-    mid_filter = bool(body.get("mid_filter", False))
-    mode = str(body.get("mode", DEFAULT_MODE))
+    spread_min_pct = float(body.get("spread_min_pct", DEFAULT_SPREAD_MIN_PCT))
+    one_signal_per_bar = bool(body.get("one_signal_per_bar", DEFAULT_ONE_SIGNAL_PER_BAR))
     on_close_only = bool(body.get("on_close_only", DEFAULT_ON_CLOSE_ONLY))
     try:
-        await MANAGER.restart(syms, interval, leverage, mid_filter, mode, on_close_only)
+        await MANAGER.restart(syms, interval, leverage, spread_min_pct, one_signal_per_bar, on_close_only)
         return JSONResponse({"ok": True})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
