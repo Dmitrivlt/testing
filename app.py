@@ -111,20 +111,27 @@ async def _signed_get_with_backoff(http: httpx.AsyncClient, url: str, *,
 
 # ---------- TV-like EMA ----------
 def tv_ema_series(closes: List[float], length: int) -> List[Optional[float]]:
+    """
+    Полный эквивалент pandas ewm(adjust=False) для EMA:
+      - seed = первый close ряда (а не SMA первых N баров)
+      - EMA_t = alpha*close_t + (1-alpha)*EMA_{t-1}, где alpha=2/(length+1)
+      - значения считаются на каждом элементе ряда (как ewm), 
+        но использовать будем только последний (как у 'Васи' в on_bar_close)
+    """
     n = len(closes)
-    out: List[Optional[float]] = [None]*n
+    out: List[Optional[float]] = [None] * n
     if length < 1 or n == 0:
         return out
-    if n < length:
-        seed = sum(closes)/max(1, n)
-        out[-1] = seed
-        return out
-    seed = sum(closes[:length]) / length
-    out[length-1] = seed
-    alpha = 2.0/(length+1.0)
-    prev = seed
-    for i in range(length, n):
-        prev = alpha*closes[i] + (1.0-alpha)*prev
+
+    alpha = 2.0 / (length + 1.0)
+
+    # seed строго = первый close (эквивалент ewm(..., adjust=False))
+    prev = float(closes[0])
+    out[0] = prev
+
+    for i in range(1, n):
+        c = float(closes[i])
+        prev = alpha * c + (1.0 - alpha) * prev
         out[i] = prev
     return out
 
