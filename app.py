@@ -1301,7 +1301,7 @@ TF_OPTIONS = "".join([f"<option{' selected' if tf==DEFAULT_INTERVAL else ''}>{tf
 
 HTML_TEMPLATE = """
 <!doctype html><html><head><meta charset="utf-8"/>
-<title>EMA Touch — Binance Futures</title>
+<title>Volontyr — Bot</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
 :root {
