@@ -40,7 +40,7 @@ LEVERAGE_CAP         = 50
 UTILIZATION          = 1.00
 FEE_BUFFER_RATE      = 0.001
 WARMUP_LIMIT         = 1200
-MID_GAP_THRESHOLD    = float(os.getenv("MID_GAP_THRESHOLD", "0.01"))  # 1%
+MID_GAP_THRESHOLD    = float(os.getenv("MID_GAP_THRESHOLD", "0.005"))  # 0.5%
 
 DEFAULT_ON_CLOSE_ONLY = False   # OFF = Touch (intrabar)
 DEFAULT_MODE = "BOTH"           # BOTH | LONG
