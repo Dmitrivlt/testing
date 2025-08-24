@@ -1,47 +1,40 @@
-# app.py — Binance USDT-M Futures EMA Touch Trader (v1.8.6, custom UI)
-# Изменения:
-# - UI: убраны Source/Signal; Avail USDT -> Balance; Pos -> Position ($) по lastPrice; PnL Today -> uPnL (+ uPnL%).
-# - Добавлен favicon в <head>.
-# - Leverage формат целым числом.
-# - Сервер: в статусе появились lastPrice, uPnL, uPnL_pct, balance (дублирует availableUSDT).
-# - uPnL считается по mark≈lastPrice: (last - entry)*net_pos (one-way) или раздельно по LONG/SHORT (hedge).
-
 import os, time, math, json, asyncio, random, hmac, hashlib
 import datetime as dt
 from typing import Optional, Dict, List, Tuple, Any
-
 import httpx, websockets
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ---------- Binance Futures (USDT-M) ----------
 BINANCE_API = "https://fapi.binance.com"
-WS_PUBLIC   = "wss://fstream.binance.com/ws"
+WS_PUBLIC = "wss://fstream.binance.com/ws"
 
-API_KEY        = os.getenv("BINANCE_API_KEY", "")
+API_KEY = os.getenv("BINANCE_API_KEY", "")
 API_SECRET_RAW = os.getenv("BINANCE_API_SECRET", "")
-API_SECRET     = API_SECRET_RAW.encode() if API_SECRET_RAW else b""
+API_SECRET = API_SECRET_RAW.encode() if API_SECRET_RAW else b""
 
-HTTP_TIMEOUT   = 10.0
-TIME_DRIFT_MS  = 0
-TIME_SYNC_SEC  = 300
+HTTP_TIMEOUT = 10.0
+TIME_DRIFT_MS = 0
+TIME_SYNC_SEC = 300
 
 # ---------- Strategy / risk defaults ----------
-DEFAULT_INTERVAL     = "1m"
-DEFAULT_LEVERAGE     = 1   # по умолчанию 1х
-LEVERAGE_CAP         = 50
-UTILIZATION          = 1.00
-FEE_BUFFER_RATE      = 0.001
-WARMUP_LIMIT         = 1200
-MID_GAP_THRESHOLD    = float(os.getenv("MID_GAP_THRESHOLD", "0.01"))  # 1%
+DEFAULT_INTERVAL = "1m"
+DEFAULT_LEVERAGE = 1  # по умолчанию 10х
+LEVERAGE_CAP = 50
+UTILIZATION = 1.00
+FEE_BUFFER_RATE = 0.001
+WARMUP_LIMIT = 1200
 
-DEFAULT_ON_CLOSE_ONLY = False   # OFF = Touch (intrabar)
-DEFAULT_MODE = "BOTH"           # BOTH | LONG
-
+MID_GAP_THRESHOLD = float(os.getenv("MID_GAP_THRESHOLD", "0.01"))  # 1%
+DEFAULT_ON_CLOSE_ONLY = False  # OFF = Touch (intrabar)
+DEFAULT_MODE = "BOTH"  # BOTH | LONG
 AUTO_FALLBACK_SYMBOL = "CYBERUSDT"  # если авто-пик не удался
 
+# Источник цены для EMA: close | hl2 | hlc3 | ohlc4
+EMA_PRICE_SRC = os.getenv("EMA_PRICE_SRC", "close").lower()
+
 NATIVE_INTERVALS = {"1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d","3d","1w","1M"}
-ALL_INTERVALS    = ["1s"] + sorted(
+ALL_INTERVALS = ["1s"] + sorted(
     list(NATIVE_INTERVALS),
     key=lambda x: ["m","h","d","w","M"].index(x[-1]) * 1000 + int(x[:-1])
 )
@@ -49,10 +42,32 @@ ALL_INTERVALS    = ["1s"] + sorted(
 def now_ms() -> int:
     return int(time.time()*1000)
 
+# ---------- Helpers: price source ----------
+def _price_from_ohlc(o: float, h: float, l: float, c: float) -> float:
+    s = EMA_PRICE_SRC
+    if s == "hl2":
+        return (h + l) / 2.0
+    if s == "hlc3":
+        return (h + l + c) / 3.0
+    if s == "ohlc4":
+        return (o + h + l + c) / 4.0
+    return c  # close (default)
+
+def _kline_row_price(row: list) -> float:
+    # Binance kline array: [0 openTime, 1 open, 2 high, 3 low, 4 close, 5 volume, ...]
+    o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4])
+    return _price_from_ohlc(o, h, l, c)
+
+def _kline_tick_price(k: dict) -> float:
+    # WS "k" payload has string fields o,h,l,c
+    try:
+        o = float(k.get("o", 0)); h = float(k.get("h", 0)); l = float(k.get("l", 0)); c = float(k.get("c", 0))
+    except Exception:
+        c = float(k.get("c", 0.0)); o = h = l = c
+    return _price_from_ohlc(o, h, l, c)
+
 # ---------- Backoff helpers ----------
-async def _get_with_backoff(http: httpx.AsyncClient, url: str, *,
-                            params: Optional[dict]=None, headers: Optional[dict]=None,
-                            max_tries: int=6) -> httpx.Response:
+async def _get_with_backoff(http: httpx.AsyncClient, url: str, *, params: Optional[dict]=None, headers: Optional[dict]=None, max_tries: int=6) -> httpx.Response:
     delay = 0.8
     for _ in range(max_tries):
         try:
@@ -67,9 +82,9 @@ async def _get_with_backoff(http: httpx.AsyncClient, url: str, *,
             return r
         except httpx.TransportError:
             await asyncio.sleep(0.6 + random.uniform(0,0.4))
-    r = await http.get(url, params=params, headers=headers)
-    r.raise_for_status()
-    return r
+            r = await http.get(url, params=params, headers=headers)
+            r.raise_for_status()
+            return r
 
 def _sign(params: Dict[str, str]) -> List[Tuple[str,str]]:
     items = sorted([(k, str(v)) for k, v in params.items()], key=lambda x: x[0])
@@ -78,8 +93,7 @@ def _sign(params: Dict[str, str]) -> List[Tuple[str,str]]:
     items.append(("signature", sig))
     return items
 
-async def _signed_get_with_backoff(http: httpx.AsyncClient, url: str, *,
-                                   params: Dict[str,str], max_tries: int=6) -> httpx.Response:
+async def _signed_get_with_backoff(http: httpx.AsyncClient, url: str, *, params: Dict[str,str], max_tries: int=6) -> httpx.Response:
     headers = {"X-MBX-APIKEY": API_KEY}
     delay = 0.8
     for _ in range(max_tries):
@@ -96,22 +110,31 @@ async def _signed_get_with_backoff(http: httpx.AsyncClient, url: str, *,
             return r
         except httpx.TransportError:
             await asyncio.sleep(0.6 + random.uniform(0,0.4))
-    qp = _sign(params)
-    r = await http.get(url, params=qp, headers=headers)
-    if r.status_code not in (418, 429):
-        r.raise_for_status()
-    return r
+            qp = _sign(params)
+            r = await http.get(url, params=qp, headers=headers)
+            if r.status_code not in (418, 429):
+                r.raise_for_status()
+            return r
 
-# ---------- TV-like EMA ----------
+# ---------- EMA (как у "Васи": seed = SMA(N)) ----------
 def tv_ema_series(closes: List[float], length: int) -> List[Optional[float]]:
+    """
+    EMA с инициализацией SMA(N), идентично классическому TV-подходу:
+    - до появления length баров -> None
+    - на индексе length-1 -> seed = SMA первых N
+    - далее: EMA_t = alpha*close_t + (1-alpha)*EMA_{t-1}, alpha=2/(length+1)
+    """
     n = len(closes)
     out: List[Optional[float]] = [None] * n
     if length < 1 or n == 0:
         return out
+    if n < length:
+        return out
     alpha = 2.0 / (length + 1.0)
-    prev = float(closes[0])
-    out[0] = prev
-    for i in range(1, n):
+    seed = sum(float(x) for x in closes[:length]) / float(length)
+    out[length-1] = float(seed)
+    prev = float(seed)
+    for i in range(length, n):
         c = float(closes[i])
         prev = alpha * c + (1.0 - alpha) * prev
         out[i] = prev
@@ -125,7 +148,7 @@ def tv_ema_next(prev: float, close_price: float, length: int) -> float:
 class FuturesClient:
     def __init__(self, symbol: str, http: httpx.AsyncClient):
         self.symbol = symbol.upper()
-        self.http   = http
+        self.http = http
         # filters
         self.tick: Optional[float] = None
         self.step: Optional[float] = None
@@ -150,14 +173,13 @@ class FuturesClient:
         try:
             r = await _get_with_backoff(self.http, f"{BINANCE_API}/fapi/v1/time")
             server_ms = int(r.json()["serverTime"])
-            local_ms  = now_ms()
+            local_ms = now_ms()
             TIME_DRIFT_MS = server_ms - local_ms
         except Exception as e:
             print("time sync:", e)
 
     async def fetch_filters(self):
-        r = await _get_with_backoff(self.http, f"{BINANCE_API}/fapi/v1/exchangeInfo",
-                                    params={"symbol": self.symbol})
+        r = await _get_with_backoff(self.http, f"{BINANCE_API}/fapi/v1/exchangeInfo", params={"symbol": self.symbol})
         data = r.json()
         syms = {s["symbol"]: s for s in data.get("symbols", [])}
         if self.symbol not in syms:
@@ -183,8 +205,7 @@ class FuturesClient:
         try:
             ts = now_ms() + TIME_DRIFT_MS
             r = await _signed_get_with_backoff(
-                self.http,
-                f"{BINANCE_API}/fapi/v1/positionSide/dual",
+                self.http, f"{BINANCE_API}/fapi/v1/positionSide/dual",
                 params={"timestamp": ts, "recvWindow": 5000}
             )
             if r.status_code in (418, 429):
@@ -205,39 +226,34 @@ class FuturesClient:
         )
         r.raise_for_status()
         acc = r.json()
-
         self.available_usdt = 0.0
         self.net_pos = 0.0
         self.entry_px = 0.0
         self.long_pos = self.short_pos = 0.0
         self.long_entry = self.short_entry = 0.0
-
         for a in acc.get("assets", []):
             if a.get("asset") == "USDT":
                 self.available_usdt = float(a.get("availableBalance", "0"))
                 break
-
         for p in acc.get("positions", []):
             if p.get("symbol") != self.symbol:
                 continue
             side = p.get("positionSide", "BOTH")
-            amt  = float(p.get("positionAmt", "0"))
-            ent  = float(p.get("entryPrice", "0"))
+            amt = float(p.get("positionAmt", "0"))
+            ent = float(p.get("entryPrice", "0"))
             try:
                 self.leverage = int(float(p.get("leverage", self.leverage)))
             except Exception:
                 pass
-
             if side == "BOTH":
-                self.net_pos  = amt
+                self.net_pos = amt
                 self.entry_px = ent
             elif side == "LONG":
-                self.long_pos   = amt
+                self.long_pos = amt
                 self.long_entry = ent
             elif side == "SHORT":
-                self.short_pos   = abs(amt)
+                self.short_pos = abs(amt)
                 self.short_entry = ent
-
         if not self.dual_side:
             if self.net_pos > 0:
                 self.long_pos, self.short_pos = self.net_pos, 0.0
@@ -281,10 +297,12 @@ class FuturesClient:
         return float(f"{q:.{prec}f}")
 
     def min_qty_for_notional(self, price: float) -> float:
+        """Минимум, чтобы удовлетворить и minNotional, и minQty."""
         need_by_notional = self._round_qty_ceil(self.min_notional / max(price, 1e-12))
         return max(self.min_qty, need_by_notional)
 
     def max_affordable_qty(self, price: float) -> float:
+        """Максимум, исходя из доступного нотионала (учитываем буфер)."""
         notional_cap = max(0.0, self.available_usdt - self.available_usdt*FEE_BUFFER_RATE) * self.leverage * UTILIZATION
         q = self._round_qty_floor(notional_cap / max(price, 1e-12))
         if self.max_qty > 0:
@@ -294,7 +312,7 @@ class FuturesClient:
     def compute_order_qty(self, ref_price: float) -> Optional[float]:
         price = max(ref_price, 1e-12)
         need = self.min_qty_for_notional(price)
-        cap  = self.max_affordable_qty(price)
+        cap = self.max_affordable_qty(price)
         if cap < need - 1e-12:
             return None
         qty = max(need, cap)
@@ -302,22 +320,25 @@ class FuturesClient:
 
     async def fetch_last_price(self) -> Optional[float]:
         try:
-            r = await _get_with_backoff(self.http, f"{BINANCE_API}/fapi/v1/ticker/price",
-                                        params={"symbol": self.symbol})
+            r = await _get_with_backoff(self.http, f"{BINANCE_API}/fapi/v1/ticker/price", params={"symbol": self.symbol})
             return float(r.json().get("price"))
         except Exception:
             return None
 
-    async def place_market(self, side: str, qty: float, *,
-                           reduce_only: bool=False,
-                           position_side: Optional[str]=None) -> Tuple[Optional[int], Optional[str]]:
+    async def place_market(self, side: str, qty: float, *, reduce_only: bool=False, position_side: Optional[str]=None) -> Tuple[Optional[int], Optional[str]]:
+        """
+        Универсальный маркет-ордер.
+        ВНИМАНИЕ: в hedge-режиме reduceOnly НЕ отправляем (иначе -1106).
+        """
         ts = now_ms() + TIME_DRIFT_MS
         params = {
-            "symbol": self.symbol, "side": side, "type": "MARKET",
+            "symbol": self.symbol,
+            "side": side,
+            "type": "MARKET",
             "quantity": f"{qty}",
-            "timestamp": ts, "recvWindow": 5000
+            "timestamp": ts,
+            "recvWindow": 5000
         }
-
         if self.dual_side:
             if position_side is None:
                 position_side = "LONG" if side == "BUY" else "SHORT"
@@ -325,7 +346,6 @@ class FuturesClient:
         else:
             if reduce_only:
                 params["reduceOnly"] = "true"
-
         try:
             r = await self.http.post(
                 f"{BINANCE_API}/fapi/v1/order",
@@ -354,11 +374,16 @@ class FuturesClient:
         qty_override: Optional[float] = None,
         open_prefer_qty: Optional[float] = None
     ) -> Tuple[Optional[int], Optional[str]]:
+        """
+        Маркет с ретраями.
+        - Для reduce_only берём фактический размер позиции (или qty_override).
+        - Для открытия сначала пробуем open_prefer_qty (например, размер только что закрытой позиции),
+          если не проходит — уменьшаем ступенями, потом fallback к compute_order_qty().
+        """
         price = ref_price if ref_price > 0 else (await self.fetch_last_price() or 0.0)
-
         await self.fetch_account()
-        before_net   = self.net_pos
-        before_long  = self.long_pos
+        before_net = self.net_pos
+        before_long = self.long_pos
         before_short = self.short_pos
 
         if qty_override is not None:
@@ -376,16 +401,15 @@ class FuturesClient:
         else:
             if open_prefer_qty and open_prefer_qty > 0:
                 need = self.min_qty_for_notional(price)
-                cap  = self.max_affordable_qty(price)
-                q0   = self._round_qty_floor(open_prefer_qty)
-                qty  = max(need, min(q0, cap))
+                cap = self.max_affordable_qty(price)
+                q0 = self._round_qty_floor(open_prefer_qty)
+                qty = max(need, min(q0, cap))
                 if qty < need - 1e-12:
                     qty = None
             else:
                 qty = self.compute_order_qty(price)
-
-        if not qty:
-            return (None, "minNotional/minQty check failed")
+            if not qty:
+                return (None, "minNotional/minQty check failed")
 
         last_err = None
 
@@ -409,27 +433,21 @@ class FuturesClient:
 
         for attempt in range(8):
             oid, err = await self.place_market(
-                side,
-                qty,
+                side, qty,
                 reduce_only=reduce_only,
                 position_side=position_side
             )
-
             await self.fetch_account()
             if oid and changed_ok():
                 return (oid, None)
-
             last_err = (err or "unknown error")
-
             if reduce_only:
                 break
-
             need = self.min_qty_for_notional(price)
-            cap  = self.max_affordable_qty(price)
+            cap = self.max_affordable_qty(price)
             if cap < need - 1e-12:
                 qty = None
                 break
-
             next_q = min(self._round_qty_floor(qty * 0.85), cap)
             if next_q < need:
                 next_q = need
@@ -437,7 +455,6 @@ class FuturesClient:
                 break
             qty = next_q
             await asyncio.sleep(0.12 * (attempt + 1))
-
         return (None, last_err or "failed after retries")
 
 # ---------- 1-second aggregator ----------
@@ -468,9 +485,7 @@ class SecAggregator:
 
 # ---------- EMA Touch Runner ----------
 class EMARunner:
-    def __init__(self, symbol: str, interval: str, leverage: int,
-                 mid_filter: bool, mode: str, on_close_only: bool,
-                 http: httpx.AsyncClient):
+    def __init__(self, symbol: str, interval: str, leverage: int, mid_filter: bool, mode: str, on_close_only: bool, http: httpx.AsyncClient):
         self.symbol = symbol.upper()
         self.interval = interval
         self.target_leverage = max(1, min(leverage, LEVERAGE_CAP))
@@ -482,12 +497,11 @@ class EMARunner:
         self.c = FuturesClient(self.symbol, http)
 
         self.closes: List[float] = []
-        self.ema50: Optional[float]  = None
+        self.ema50: Optional[float] = None
         self.ema100: Optional[float] = None
         self.ema200: Optional[float] = None
 
         self.prev_tick_price: Optional[float] = None
-        self.last_price: Optional[float] = None  # <— для uPnL/нотионала
 
         self.running = False
         self._tasks: List[asyncio.Task] = []
@@ -516,17 +530,16 @@ class EMARunner:
                 params={"symbol": self.symbol, "interval": self.interval, "limit": WARMUP_LIMIT}
             )
             data = r.json()
-            closes = [float(x[4]) for x in data]
+            closes = [_kline_row_price(x) for x in data]
             if not closes:
                 return
             self.closes = closes
-            e50 = tv_ema_series(closes, 50)
-            e100= tv_ema_series(closes, 100)
-            e200= tv_ema_series(closes, 200)
+            e50  = tv_ema_series(closes, 50)
+            e100 = tv_ema_series(closes, 100)
+            e200 = tv_ema_series(closes, 200)
             self.ema50  = e50[-1]
             self.ema100 = e100[-1]
             self.ema200 = e200[-1]
-            self.last_price = closes[-1]
         except Exception as e:
             self.last_error = f"warmup_native: {e}"
 
@@ -543,8 +556,8 @@ class EMARunner:
         aggr: Dict[int, Dict[str, float]] = {}
         for t in trades:
             ts = int(t["T"]) // 1000
-            p  = float(t["p"])
-            q  = float(t["q"])
+            p = float(t["p"])
+            q = float(t["q"])
             if ts not in aggr:
                 aggr[ts] = {"o": p, "h": p, "l": p, "c": p, "v": q}
             else:
@@ -556,13 +569,12 @@ class EMARunner:
             return
         closes = [aggr[s]["c"] for s in sorted(aggr.keys())]
         self.closes = closes
-        e50 = tv_ema_series(closes, 50)
-        e100= tv_ema_series(closes, 100)
-        e200= tv_ema_series(closes, 200)
+        e50  = tv_ema_series(closes, 50)
+        e100 = tv_ema_series(closes, 100)
+        e200 = tv_ema_series(closes, 200)
         self.ema50  = e50[-1]
         self.ema100 = e100[-1]
         self.ema200 = e200[-1]
-        self.last_price = closes[-1]
 
     # ---------- EMA update only on bar close ----------
     async def _on_bar_close(self, close_price: float, bar_key: str):
@@ -588,7 +600,6 @@ class EMARunner:
         self.last_bar_key = bar_key
         self.fired_50_this_bar = False
         self.fired_200_this_bar = False
-        self.last_price = close_price
 
     # ---------- Touch detector (интрабар) ----------
     def _touch_signal_on_price(self, price: float, bar_key: Optional[str]) -> Optional[str]:
@@ -596,20 +607,19 @@ class EMARunner:
             return None
         prev = self.prev_tick_price if self.prev_tick_price is not None else price
         self.prev_tick_price = price
-        self.last_price = price
 
         sig: Optional[str] = None
         same_bar = (bar_key is not None and bar_key == self.last_bar_key)
 
         if not (same_bar and self.fired_50_this_bar):
-            up   = prev < self.ema50 <= price
+            up = prev < self.ema50 <= price
             down = prev > self.ema50 >= price
             if up or down:
                 sig = "LONG" if up else "SHORT"
                 self.fired_50_this_bar = True
 
         if sig is None and not (same_bar and self.fired_200_this_bar):
-            up   = prev < self.ema200 <= price
+            up = prev < self.ema200 <= price
             down = prev > self.ema200 >= price
             if up or down:
                 sig = "LONG" if up else "SHORT"
@@ -641,32 +651,13 @@ class EMARunner:
         except Exception:
             self.bot_state = "Waiting"
 
-    # ---------- uPnL helper ----------
-    def _compute_upnl(self) -> Tuple[Optional[float], Optional[float]]:
-        lp = self.last_price
-        if lp is None or lp <= 0:
-            return (None, None)
-        upnl = 0.0
-        if self.c.dual_side:
-            if self.c.long_pos > 0 and self.c.long_entry > 0:
-                upnl += (lp - self.c.long_entry) * self.c.long_pos
-            if self.c.short_pos > 0 and self.c.short_entry > 0:
-                upnl += (self.c.short_entry - lp) * self.c.short_pos
-            notional = (self.c.long_pos * lp) + (self.c.short_pos * lp)
-        else:
-            notional = abs(self.c.net_pos) * lp
-            if abs(self.c.net_pos) > 0 and self.c.entry_px > 0:
-                upnl = (lp - self.c.entry_px) * self.c.net_pos
-        pct = (upnl / notional * 100.0) if notional and notional > 0 else None
-        return (upnl, pct)
-
-    # ---------- ДЕЙСТВИЯ ПО СИГНАЛУ ----------
+    # ---------- ДЕЙСТВИЯ ПО СИГНАЛУ (flip-логика) ----------
     async def _act_on_signal(self, sig: Optional[str], ref_price: float):
         try:
             await self.c.fetch_account()
             await self.c.ensure_leverage(self.target_leverage)
-
             min_qty = max(self.c.min_qty, 0.0)
+
             if self.c.dual_side:
                 if sig == "LONG":
                     if self.c.long_pos > min_qty:
@@ -684,9 +675,8 @@ class EMARunner:
                                 self.last_action = f"EXIT SHORT FAILED ({err})"; self.last_action_ts = now_ms(); return
                             self.last_action = "EXIT SHORT ok"; self.last_action_ts = now_ms()
                             closed_qty = q
-                            await asyncio.sleep(0.25)
-                            await self.c.fetch_account()
-
+                        await asyncio.sleep(0.25)
+                        await self.c.fetch_account()
                         _, err = await self.c.place_market_smart(
                             "BUY", ref_price, reduce_only=False, position_side="LONG",
                             open_prefer_qty=(closed_qty if closed_qty>0 else None)
@@ -711,9 +701,8 @@ class EMARunner:
                                 self.last_action = f"EXIT LONG FAILED ({err})"; self.last_action_ts = now_ms(); return
                             self.last_action = "EXIT LONG ok"; self.last_action_ts = now_ms()
                             closed_qty = q
-                            await asyncio.sleep(0.25)
-                            await self.c.fetch_account()
-
+                        await asyncio.sleep(0.25)
+                        await self.c.fetch_account()
                         _, err = await self.c.place_market_smart(
                             "SELL", ref_price, reduce_only=False, position_side="SHORT",
                             open_prefer_qty=(closed_qty if closed_qty>0 else None)
@@ -748,9 +737,8 @@ class EMARunner:
                                 self.last_action = f"EXIT SHORT FAILED ({err})"; self.last_action_ts = now_ms(); return
                             self.last_action = "EXIT SHORT ok"; self.last_action_ts = now_ms()
                             closed_qty = q
-                            await asyncio.sleep(0.25)
-                            await self.c.fetch_account()
-
+                        await asyncio.sleep(0.25)
+                        await self.c.fetch_account()
                         _, err = await self.c.place_market_smart(
                             "BUY", ref_price, reduce_only=False, open_prefer_qty=(closed_qty if closed_qty>0 else None)
                         )
@@ -772,9 +760,8 @@ class EMARunner:
                                 self.last_action = f"EXIT LONG FAILED ({err})"; self.last_action_ts = now_ms(); return
                             self.last_action = "EXIT LONG ok"; self.last_action_ts = now_ms()
                             closed_qty = q
-                            await asyncio.sleep(0.25)
-                            await self.c.fetch_account()
-
+                        await asyncio.sleep(0.25)
+                        await self.c.fetch_account()
                         _, err = await self.c.place_market_smart(
                             "SELL", ref_price, reduce_only=False, open_prefer_qty=(closed_qty if closed_qty>0 else None)
                         )
@@ -792,7 +779,6 @@ class EMARunner:
 
             await self.c.fetch_account()
             self._refresh_state_nowait()
-
         except Exception as e:
             self.last_error = f"act: {e}"
 
@@ -808,28 +794,25 @@ class EMARunner:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                     async for raw in ws:
-                        if not self.running: break
+                        if not self.running:
+                            break
                         try:
                             e = json.loads(raw)
                             k = e.get("k") or {}
-                            close = float(k.get("c"))
+                            px = _kline_tick_price(k)
                             is_closed = bool(k.get("x", False))
                             bar_key = f"{k.get('t')}_{k.get('T')}"
-
                             if is_closed:
-                                await self._on_bar_close(close, bar_key)
-
+                                await self._on_bar_close(px, bar_key)
                             sig: Optional[str] = None
                             if self.on_close_only:
                                 if is_closed:
-                                    sig = self._touch_signal_on_price(close, bar_key)
+                                    sig = self._touch_signal_on_price(px, bar_key)
                             else:
-                                sig = self._touch_signal_on_price(close, bar_key if not is_closed else None)
-
+                                sig = self._touch_signal_on_price(px, bar_key if not is_closed else None)
                             self.last_signal = sig
                             if sig:
-                                await self._act_on_signal(sig, close)
-
+                                await self._act_on_signal(sig, px)
                         except Exception as ex:
                             self.last_error = f"kline parse: {ex}"
             except Exception as ex:
@@ -844,7 +827,8 @@ class EMARunner:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                     async for raw in ws:
-                        if not self.running: break
+                        if not self.running:
+                            break
                         try:
                             e = json.loads(raw)
                             p = float(e["p"]); q = float(e["q"]); ts = int(e["T"])
@@ -892,15 +876,13 @@ class EMARunner:
         self._tasks.clear()
 
     def status(self) -> dict:
-        upnl, upnl_pct = self._compute_upnl()
         return {
             "symbol": self.symbol,
             "interval": self.interval,
             "source": self.source,
             "leverage": self.target_leverage,
             "hedgeMode": self.c.dual_side,
-            "balance": self.c.available_usdt,     # <— переименовано для UI
-            "availableUSDT": self.c.available_usdt,  # (оставлено для совместимости, если где-то используется)
+            "availableUSDT": self.c.available_usdt,
             "netPos": self.c.net_pos,
             "entryPx": self.c.entry_px,
             "ema50": self.ema50,
@@ -915,10 +897,7 @@ class EMARunner:
             "lastActionTs": self.last_action_ts,
             "minNotional": self.c.min_notional,
             "minQty": self.c.min_qty,
-            "lastPrice": self.last_price,         # <— для расчёта нотионала в UI
-            "uPnL": upnl,                         # <— нереализованный PnL (USDT)
-            "uPnL_pct": upnl_pct,                 # <— % от текущего нотионала
-            "pnlToday": self.pnl_today_realized,  # (не используется в UI теперь)
+            "pnlToday": self.pnl_today_realized,
             "lastError": self.last_error
         }
 
@@ -928,12 +907,15 @@ class Manager:
         self.http = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
         self.runners: Dict[str, EMARunner] = {}
         self.running = False
+
         self.cur_interval = DEFAULT_INTERVAL
         self.cur_leverage = DEFAULT_LEVERAGE
         self.cur_mid_filter = False
         self.cur_mode = DEFAULT_MODE
         self.cur_on_close_only = DEFAULT_ON_CLOSE_ONLY
+
         self._tasks: List[asyncio.Task] = []
+
         # reconcile/external
         self.dual_side: bool = False
         self.external: Dict[str, Dict[str, Any]] = {}
@@ -949,36 +931,35 @@ class Manager:
         self._valid_syms_ttl_ms: int = 5 * 60 * 1000
 
     async def _valid_usdtm_perp_symbols(self) -> set:
+        """Список реально торгуемых USDT-M PERPETUAL символов на фьючерсах Binance."""
         now = now_ms()
         if self._valid_syms_cache and (now - self._valid_syms_cached_at_ms) < self._valid_syms_ttl_ms:
             return self._valid_syms_cache
         try:
-            r = await _get_with_backoff(self.http, f"{BINANCE_API}/fapi/v1/exchangeInfo")
-            data = r.json()
+            r = await _get_with_backoff(self.http, f"{BINANCE_API}/fapi/v1/exchangeInfo"])
+        except Exception:
+            r = None
+        try:
+            data = r.json() if r else {"symbols": []}
             valid = {
-                s["symbol"]
-                for s in data.get("symbols", [])
-                if s.get("quoteAsset") == "USDT"
-                and s.get("contractType") == "PERPETUAL"
-                and s.get("status") == "TRADING"
+                s["symbol"] for s in data.get("symbols", [])
+                if s.get("quoteAsset") == "USDT" and s.get("contractType") == "PERPETUAL" and s.get("status") == "TRADING"
             }
             if valid:
                 self._valid_syms_cache = valid
                 self._valid_syms_cached_at_ms = now
-                return valid
+            return valid
         except Exception:
-            pass
-        return self._valid_syms_cache
+            return self._valid_syms_cache
 
     async def pick_top1_symbol(self) -> Tuple[str, float]:
+        """Берём максимум priceChangePercent среди РЕАЛЬНО доступных USDT-M PERPETUAL. Если ничего не нашли/ошибка — фолбэк AUTO_FALLBACK_SYMBOL."""
         try:
             valid = await self._valid_usdtm_perp_symbols()
             if not valid:
                 return (AUTO_FALLBACK_SYMBOL, 0.0)
-
             r = await _get_with_backoff(self.http, f"{BINANCE_API}/fapi/v1/ticker/24hr")
             arr = r.json()
-
             best_sym = None
             best_pct = None
             for it in arr:
@@ -991,28 +972,25 @@ class Manager:
                     continue
                 if (best_pct is None) or (pct > best_pct):
                     best_sym, best_pct = sym, pct
-
             if best_sym:
                 return best_sym, float(best_pct or 0.0)
-
         except Exception:
             pass
-
         return (AUTO_FALLBACK_SYMBOL, 0.0)
 
-    async def start(self, symbols: List[str], interval: str, leverage: int,
-                    mid_filter: bool, mode: str, on_close_only: bool):
+    async def start(self, symbols: List[str], interval: str, leverage: int, mid_filter: bool, mode: str, on_close_only: bool):
         if self.running:
             await self.stop()
         if interval not in ALL_INTERVALS:
             raise ValueError(f"Unsupported interval: {interval}")
+
         self.cur_interval = interval
         self.cur_leverage = max(1, min(int(leverage), LEVERAGE_CAP))
-    # ...
         self.cur_mid_filter = bool(mid_filter)
         self.cur_mode = "LONG" if str(mode).upper().startswith("LONG") else "BOTH"
         self.cur_on_close_only = bool(on_close_only)
 
+        # --- обработка auto-pick ---
         syms_clean = [s.strip().upper() for s in (symbols or []) if s and s.strip()]
         self.auto_pick = (len(syms_clean) == 0)
         if self.auto_pick:
@@ -1026,19 +1004,20 @@ class Manager:
 
         self.runners.clear()
         for s in syms_clean:
-            r = EMARunner(s, self.cur_interval, self.cur_leverage,
-                          self.cur_mid_filter, self.cur_mode, self.cur_on_close_only, self.http)
+            r = EMARunner(s, self.cur_interval, self.cur_leverage, self.cur_mid_filter, self.cur_mode, self.cur_on_close_only, self.http)
             self.runners[s] = r
             try:
                 await r.run()
             except Exception as e:
                 r.last_error = f"start: {e}"
+
         self.running = True
         self._tasks.append(asyncio.create_task(self._income_loop()))
         self._tasks.append(asyncio.create_task(self._reconcile_loop()))
         self._tasks.append(asyncio.create_task(self._auto_pick_loop()))
 
     async def stop(self):
+        # закрываем позиции у воркеров
         for r in list(self.runners.values()):
             try:
                 await r.c.fetch_account()
@@ -1048,18 +1027,14 @@ class Manager:
                         await r.c.place_market_smart(
                             "SELL",
                             r.c.entry_px or (await r.c.fetch_last_price() or 0.0),
-                            reduce_only=True,
-                            position_side="LONG",
-                            qty_override=q
+                            reduce_only=True, position_side="LONG", qty_override=q
                         )
                     if r.c.short_pos > r.c.min_qty:
                         q = r.c._round_qty_floor(r.c.short_pos)
                         await r.c.place_market_smart(
                             "BUY",
                             r.c.entry_px or (await r.c.fetch_last_price() or 0.0),
-                            reduce_only=True,
-                            position_side="SHORT",
-                            qty_override=q
+                            reduce_only=True, position_side="SHORT", qty_override=q
                         )
                 else:
                     pos = r.c.net_pos
@@ -1068,20 +1043,21 @@ class Manager:
                         side = "SELL" if pos > 0 else "BUY"
                         ref_px = r.c.entry_px or (await r.c.fetch_last_price() or 0.0)
                         await r.c.place_market_smart(side, ref_px, reduce_only=True, qty_override=q)
-                        await r.c.fetch_account()
+                await r.c.fetch_account()
             except Exception as e:
                 print("stop close error:", e)
+
         for r in list(self.runners.values()):
             await r.stop()
         self.runners.clear()
         self.external.clear()
+
         self.running = False
         for t in self._tasks:
             t.cancel()
         self._tasks.clear()
 
-    async def restart(self, symbols: List[str], interval: str, leverage: int,
-                      mid_filter: bool, mode: str, on_close_only: bool):
+    async def restart(self, symbols: List[str], interval: str, leverage: int, mid_filter: bool, mode: str, on_close_only: bool):
         await self.stop()
         await self.start(symbols, interval, leverage, mid_filter, mode, on_close_only)
 
@@ -1094,11 +1070,11 @@ class Manager:
             await asyncio.sleep(60)
 
     async def refresh_income(self):
-        end_ms = now_ms() + TIME_DRIFT_MS
+        """Считаем только реальный PnL за СЕГОДНЯ (UTC), по каждому активному символу."""
+        end_ms = now_ms() + TIME_DRIFT_MS  # серверное время
         utc_now = dt.datetime.fromtimestamp(end_ms/1000.0, tz=dt.timezone.utc)
         today0 = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
         today_start_ms = int(today0.timestamp()*1000)
-
         for sym, r in self.runners.items():
             try:
                 total = 0.0
@@ -1106,19 +1082,14 @@ class Manager:
                 last_seen_time = -1
                 while start <= end_ms:
                     params = {
-                        "timestamp": end_ms,
-                        "recvWindow": 5000,
-                        "startTime": start,
-                        "endTime": end_ms,
-                        "symbol": sym,
-                        "incomeType": "REALIZED_PNL",
-                        "limit": 1000
+                        "timestamp": end_ms, "recvWindow": 5000,
+                        "startTime": start, "endTime": end_ms,
+                        "symbol": sym, "incomeType": "REALIZED_PNL", "limit": 1000
                     }
                     resp = await _signed_get_with_backoff(self.http, f"{BINANCE_API}/fapi/v1/income", params=params)
                     arr = resp.json()
                     if not isinstance(arr, list) or not arr:
                         break
-
                     max_t = start
                     for it in arr:
                         t = int(it.get("time", 0))
@@ -1127,31 +1098,29 @@ class Manager:
                             total += float(it.get("income", "0"))
                         if t > max_t:
                             max_t = t
-
                     if max_t <= last_seen_time:
                         break
                     last_seen_time = max_t
-
                     if len(arr) < 1000:
                         break
                     start = max_t + 1
-
                 r.pnl_today_realized = total
-
             except Exception as e:
                 r.last_error = f"income: {e}"
 
     async def _reconcile_loop(self):
+        """Синхронизируемся с биржей и показываем внешние позиции."""
         while self.running:
             try:
                 ts = now_ms() + TIME_DRIFT_MS
+                # dualSide
                 try:
-                    rds = await _signed_get_with_backoff(self.http, f"{BINANCE_API}/fapi/v1/positionSide/dual",
-                                                         params={"timestamp": ts, "recvWindow": 5000})
+                    rds = await _signed_get_with_backoff(self.http, f"{BINANCE_API}/fapi/v1/positionSide/dual", params={"timestamp": ts, "recvWindow": 5000})
                     self.dual_side = bool(rds.json().get("dualSidePosition", False))
                 except Exception:
                     pass
 
+                # account snapshot
                 qp = _sign({"timestamp": ts, "recvWindow": 5000})
                 acc_r = await self.http.get(f"{BINANCE_API}/fapi/v2/account", params=qp, headers={"X-MBX-APIKEY": API_KEY})
                 acc_r.raise_for_status()
@@ -1163,6 +1132,7 @@ class Manager:
                         avail_usdt = float(a.get("availableBalance", "0"))
                         break
 
+                # внешние позиции
                 ext: Dict[str, Dict[str, Any]] = {}
                 tmp: Dict[str, Dict[str, float]] = {}
                 for p in acc.get("positions", []):
@@ -1170,8 +1140,8 @@ class Manager:
                     if sym in self.runners:
                         continue
                     side = p.get("positionSide", "BOTH")
-                    amt  = float(p.get("positionAmt", "0"))
-                    ent  = float(p.get("entryPrice", "0"))
+                    amt = float(p.get("positionAmt", "0"))
+                    ent = float(p.get("entryPrice", "0"))
                     d = tmp.get(sym) or {"net":0.0, "entry":0.0, "long":0.0, "short":0.0, "long_entry":0.0, "short_entry":0.0}
                     if side == "BOTH":
                         d["net"] = amt; d["entry"] = ent
@@ -1183,7 +1153,8 @@ class Manager:
 
                 for sym, d in tmp.items():
                     has_pos = abs(d["net"])>1e-12 or d["long"]>1e-12 or d["short"]>1e-12
-                    if not has_pos: continue
+                    if not has_pos:
+                        continue
                     if self.dual_side and (d["long"]>1e-12 or d["short"]>1e-12):
                         state = "External HEDGE" if (d["long"]>1e-12 and d["short"]>1e-12) else ("External LONG" if d["long"]>1e-12 else "External SHORT")
                         pos_text = f"L:{d['long']:.6f} / S:{d['short']:.6f}"
@@ -1192,19 +1163,15 @@ class Manager:
                         state = "External LONG" if d["net"]>0 else "External SHORT"
                         pos_text = f"{d['net']:.6f}"
                         entry_text = f"{d['entry']:.6f}"
-
                     ext[sym] = {
-                        "symbol": sym, "interval": self.cur_interval, "source": "external",
-                        "leverage": self.cur_leverage, "mode": "-", "midFilter": False, "lastSignal": None,
-                        "botState": state, "balance": avail_usdt, "availableUSDT": avail_usdt,
-                        "netPos": pos_text, "entryPx": entry_text,
-                        "ema50": None, "ema100": None, "ema200": None,
-                        "lastPrice": None, "uPnL": None, "uPnL_pct": None,
-                        "pnlToday": 0.0,
-                        "lastAction": "External position", "lastError": None
+                        "symbol": sym, "interval": self.cur_interval, "source": "external", "leverage": self.cur_leverage,
+                        "mode": "-", "midFilter": False, "lastSignal": None, "botState": state, "availableUSDT": avail_usdt,
+                        "netPos": pos_text, "entryPx": entry_text, "ema50": None, "ema100": None, "ema200": None,
+                        "pnlToday": 0.0, "lastAction": "External position", "lastError": None
                     }
                 self.external = ext
 
+                # актуализируем аккаунт у активных воркеров
                 for r in self.runners.values():
                     try:
                         await r.c.fetch_account()
@@ -1217,6 +1184,11 @@ class Manager:
             await asyncio.sleep(3)
 
     async def _auto_pick_loop(self):
+        """
+        Если включён автопик (Symbols пусто):
+        - каждые 30 сек берём Топ-1 по 24h % среди валидных USDT-M PERP.
+        - если у бота НЕТ открытых позиций и Топ-1 изменился — перезапускаем на новый символ.
+        """
         while self.running:
             try:
                 if self.auto_pick:
@@ -1227,20 +1199,17 @@ class Manager:
                             minq = max(r.c.min_qty, 0.0)
                             if r.c.dual_side:
                                 if r.c.long_pos > minq or r.c.short_pos > minq:
-                                    any_open = True
-                                    break
+                                    any_open = True; break
                             else:
                                 if abs(r.c.net_pos) > minq:
-                                    any_open = True
-                                    break
+                                    any_open = True; break
                         except Exception:
                             pass
-
                     if not any_open:
                         top_sym, top_pct = await self.pick_top1_symbol()
                         if top_sym and (top_sym not in self.runners):
-                            await self.restart([top_sym], self.cur_interval, self.cur_leverage,
-                                               self.cur_mid_filter, self.cur_mode, self.cur_on_close_only)
+                            # перезапуск на новый Топ-1
+                            await self.restart([top_sym], self.cur_interval, self.cur_leverage, self.cur_mid_filter, self.cur_mode, self.cur_on_close_only)
                             self.auto_pick = True
                             self.auto_current_symbol = top_sym
                             self.auto_current_pct = top_pct
@@ -1278,14 +1247,10 @@ TF_OPTIONS = "".join([f"<option{' selected' if tf==DEFAULT_INTERVAL else ''}>{tf
 
 HTML_TEMPLATE = """
 <!doctype html><html><head><meta charset="utf-8"/>
-<title>Volontyr — Bot</title>
-<link rel="icon" href="https://www.google.com/imgres?q=btc%20icon&imgurl=https%3A%2F%2Fmedia.istockphoto.com%2Fid%2F1139020309%2Fvector%2Fbitcoin-internet-money-icon-vector.jpg%3Fs%3D612x612%26w%3D0%26k%3D20%26c%3DvcRUEDzhndMOctdM7PN1qmipo5rY_aOByWFW0IkW8bs%3D&imgrefurl=https%3A%2F%2Fwww.istockphoto.com%2Fillustrations%2Fbitcoin-icon&docid=2BBla4FhEiIvOM&tbnid=YEPC3oMWYv1CdM&vet=12ahUKEwjokJjkq6OPAxVnRPEDHRSPGnYQM3oECCIQAA..i&w=612&h=612&hcb=2&ved=2ahUKEwjokJjkq6OPAxVnRPEDHRSPGnYQM3oECCIQAA">
+<title>EMA Touch — Binance Futures</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
-:root {
-  --bg:#0f172a; --card:#111827; --muted:#94a3b8; --text:#e5e7eb; --border:#1f2937;
-  --green:#22c55e; --red:#ef4444; --blue:#3b82f6; --amber:#f59e0b; --gray:#6b7280;
-}
+:root { --bg:#0f172a; --card:#111827; --muted:#94a3b8; --text:#e5e7eb; --border:#1f2937; --green:#22c55e; --red:#ef4444; --blue:#3b82f6; --amber:#f59e0b; --gray:#6b7280; }
 * { box-sizing:border-box; }
 body { margin:0; background:linear-gradient(180deg,#0b1220 0%,#0f172a 100%); color:var(--text); font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial; }
 .container { max-width:1200px; margin:24px auto; padding:0 16px; }
@@ -1300,25 +1265,21 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
 .pill { display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px; font-size:12px; }
 .on { background:rgba(34,197,94,.15); color:#86efac; border:1px solid rgba(34,197,94,.4); }
 .off{ background:rgba(239,68,68,.15); color:#fca5a5; border:1px solid rgba(239,68,68,.35); }
-
 .table { width:100%; border-collapse:separate; border-spacing:0 8px; }
 .table thead th { text-align:left; font-size:12px; color:var(--muted); font-weight:500; padding:8px 10px; }
 .table tbody tr { background:#0b1020; border:1px solid var(--border); border-radius:12px; overflow:hidden; }
 .table tbody td { padding:10px; border-bottom:1px solid var(--border); font-size:14px; }
 .table tbody tr:last-child td { border-bottom:none; }
-
 .status-badge { padding:4px 10px; border-radius:999px; font-size:12px; font-weight:600; }
 .waiting { background:#1f2937; color:#cbd5e1; }
-.long    { background:rgba(34,197,94,.2); color:#86efac; }
-.short   { background:rgba(239,68,68,.2); color:#fca5a5; }
-
+.long { background:rgba(34,197,94,.2); color:#86efac; }
+.short { background:rgba(239,68,68,.2); color:#fca5a5; }
 /* iOS-style switches */
 .switch { position:relative; width:54px; height:30px; background:#374151; border-radius:999px; transition:background .2s ease; border:1px solid #4b5563; cursor:pointer; }
 .switch input { display:none; }
-.switch .thumb { position:absolute; top:2px; left:3px; width:24px; height:24px; background:#fff; border-radius:50%; transition:left .2s ease; box-shadow: 0 2px 8px rgba(0,0,0,.35); }
+.switch .thumb { position:absolute; top:3px; left:3px; width:24px; height:24px; background:#fff; border-radius:50%; transition:left .2s ease; box-shadow: 0 2px 8px rgba(0,0,0,.35); }
 .switch.on { background:#16a34a; border-color:#16a34a; }
 .switch.on .thumb { left:27px; }
-
 .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap:12px; }
 .small { color:var(--muted); font-size:12px; }
 .kpi { display:flex; gap:8px; align-items:center; }
@@ -1327,66 +1288,65 @@ button.danger { background:linear-gradient(90deg,#ef4444,#f43f5e); color:#fff; b
 </head>
 <body>
 <div class="container">
-  <h2>EMA Touch — Binance Futures</h2>
-  <div class="card">
-    <div class="grid">
-      <div>
-        <label class="title">Symbols (comma)</label><br/>
-        <input id="sym" type="text" value="" placeholder="choose a coin"/>
-        <div class="small">Оставь пустым — бот выберет Топ-1 24h % автоматически (USDT-M PERP). Фолбэк: CYBERUSDT.</div>
-      </div>
-      <div>
-        <label class="title">Timeframe</label><br/>
-        <select id="tf">%%TF_OPTIONS%%</select>
-      </div>
-      <div>
-        <label class="title">Leverage</label><br/>
-        <input id="lev" type="number" value="1" min="1" max="50" step="1"/>
-      </div>
-      <div>
-        <label class="title">Mode</label><br/>
-        <select id="mode">
-          <option selected>Both</option>
-          <option>Long only</option>
-        </select>
-      </div>
-      <div>
-        <label class="title">Mid filter</label><br/>
-        <div id="mid" class="switch on"><input type="checkbox"/><div class="thumb"></div></div>
-      </div>
-      <div>
-        <label class="title">Signal: Close-only</label><br/>
-        <div id="closeonly" class="switch"><input type="checkbox"/><div class="thumb"></div></div>
-        <div class="small">OFF = Touch (intrabar)</div>
-      </div>
+<h2>EMA Touch — Binance Futures</h2>
+<div class="card">
+  <div class="grid">
+    <div>
+      <label class="title">Symbols (comma)</label><br/>
+      <input id="sym" type="text" value="" placeholder="choose a coin"/>
+      <div class="small">Оставь пустым — бот выберет Топ-1 24h % автоматически (USDT-M PERP). Фолбэк: CYBERUSDT.</div>
     </div>
-
-    <div class="row" style="margin-top:12px;">
-      <button id="btnStart" class="primary" onclick="start()">Start</button>
-      <button class="danger"  onclick="stop()">Stop</button>
-      <button class="secondary" onclick="restart()">Restart</button>
-      <span id="flag" class="pill off">Stopped</span>
+    <div>
+      <label class="title">Timeframe</label><br/>
+      <select id="tf">%%TF_OPTIONS%%</select>
+    </div>
+    <div>
+      <label class="title">Leverage</label><br/>
+      <input id="lev" type="number" value="10" min="1" max="50" step="1"/>
+    </div>
+    <div>
+      <label class="title">Mode</label><br/>
+      <select id="mode">
+        <option selected>Both</option>
+        <option>Long only</option>
+      </select>
+    </div>
+    <div>
+      <label class="title">Mid filter</label><br/>
+      <div id="mid" class="switch"><input type="checkbox"/><div class="thumb"></div></div>
+    </div>
+    <div>
+      <label class="title">Signal: Close-only</label><br/>
+      <div id="closeonly" class="switch"><input type="checkbox"/><div class="thumb"></div></div>
+      <div class="small">OFF = Touch (intrabar)</div>
     </div>
   </div>
-
-  <div style="height:16px"></div>
-
-  <div class="card">
-    <table class="table">
-      <thead>
-        <tr>
-          <th>Symbol</th><th>TF</th><th>Lev</th><th>Mode</th><th>Mid</th><th>Bot</th>
-          <th>Balance</th><th>Position ($)</th><th>Entry</th>
-          <th>EMA50</th><th>EMA100</th><th>EMA200</th>
-          <th>uPnL</th><th>Last Action</th><th>Error</th>
-        </tr>
-      </thead>
-      <tbody id="tbody"></tbody>
-    </table>
-    <div class="small" style="margin-top:8px;">
-      uPnL считается по текущей цене. Положительный — зелёный, отрицательный — красный.
-    </div>
+  <div class="row" style="margin-top:12px;">
+    <button id="btnStart" class="primary" onclick="start()">Start</button>
+    <button class="danger" onclick="stop()">Stop</button>
+    <button class="secondary" onclick="restart()">Restart</button>
+    <span id="flag" class="pill off">Stopped</span>
   </div>
+</div>
+
+<div style="height:16px"></div>
+
+<div class="card">
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Symbol</th><th>TF</th><th>Source</th><th>Lev</th><th>Mode</th><th>Mid</th><th>Signal</th><th>Bot</th>
+        <th>Avail USDT</th><th>Pos</th><th>Entry</th>
+        <th>EMA50</th><th>EMA100</th><th>EMA200</th>
+        <th>PnL Today (R)</th><th>Last Action</th><th>Error</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+  <div class="small" style="margin-top:8px;">
+    Реализованный PnL считается за календарные сутки UTC. Положительный — зелёный, отрицательный — красный.
+  </div>
+</div>
 </div>
 
 <script>
@@ -1416,53 +1376,58 @@ function params(){
 async function post(path, body){
   const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
   if(!r.ok){
-    let msg = await r.text(); try{ msg = JSON.parse(msg).error || msg; }catch(_){}
+    let msg = await r.text();
+    try{ msg = JSON.parse(msg).error || msg; }catch(_){}
     throw new Error(msg);
   }
   return r.json();
 }
-async function get(path){ const r=await fetch(path); if(!r.ok) throw new Error(await r.text()); return r.json(); }
-
-async function start(){ try{ const p=params(); await post('/api/start',{symbols:symbols(), ...p}); await refresh(); }catch(e){ alert('Start: '+e.message); } }
-async function stop(){ try{ await post('/api/stop',{}); await refresh(); }catch(e){ alert('Stop: '+e.message); } }
-async function restart(){ try{ const p=params(); await post('/api/restart',{symbols:symbols(), ...p}); await refresh(); }catch(e){ alert('Restart: '+e.message); } }
-
+async function get(path){
+  const r=await fetch(path);
+  if(!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+async function start(){
+  try{ const p=params(); await post('/api/start',{symbols:symbols(), ...p}); await refresh(); }
+  catch(e){ alert('Start: '+e.message); }
+}
+async function stop(){
+  try{ await post('/api/stop',{}); await refresh(); }
+  catch(e){ alert('Stop: '+e.message); }
+}
+async function restart(){
+  try{ const p=params(); await post('/api/restart',{symbols:symbols(), ...p}); await refresh(); }
+  catch(e){ alert('Restart: '+e.message); }
+}
 function td(v){
   const d=document.createElement('td');
   if(v==null) v='';
   if(typeof v==='number'){
-    // общее форматирование чисел (по умолчанию 6 знаков)
     d.textContent = Math.abs(v) >= 0.0001 ? v.toFixed(6) : v.toString();
-  } else { d.textContent = v; }
-  return d;
-}
-function tdInt(v){
-  const d=document.createElement('td');
-  if(v==null || isNaN(v)) d.textContent='';
-  else d.textContent = parseInt(v);
-  return d;
-}
-function tdMoney(v){
-  const d=document.createElement('td');
-  if(v==null || isNaN(v)) d.textContent='';
-  else d.textContent = Number(v).toFixed(2);
+  } else {
+    d.textContent = v;
+  }
   return d;
 }
 function stateBadge(state){
-  const span=document.createElement('span'); span.className='status-badge';
-  if(state==='LONG'){ span.classList.add('long');  span.textContent='LONG'; }
+  const span=document.createElement('span');
+  span.className='status-badge';
+  if(state==='LONG'){ span.classList.add('long'); span.textContent='LONG'; }
   else if(state==='SHORT'){ span.classList.add('short'); span.textContent='SHORT'; }
   else { span.classList.add('waiting'); span.textContent=state || 'Waiting'; }
   return span;
 }
-function pnlCell(v, pct){
+function sigText(sig){
+  if(!sig) return '';
+  if(sig==='SHORT_EXIT_ONLY') return 'SHORT (exit only)';
+  return sig;
+}
+function pnlCell(v){
   const tdEl=document.createElement('td');
   const b=document.createElement('span');
   b.className='status-badge';
   let num = (typeof v==='number') ? v : parseFloat(v||0) || 0;
-  let pctNum = (typeof pct==='number') ? pct : parseFloat(pct||0);
-  const txt = (isFinite(num) ? num.toFixed(2) : '') + (isFinite(pctNum) ? ` (${pctNum.toFixed(2)}%)` : '');
-  b.textContent = txt.trim();
+  b.textContent = Math.abs(num) >= 0.0001 ? num.toFixed(6) : num.toString();
   if(num > 0) b.classList.add('long');
   else if(num < 0) b.classList.add('short');
   else b.classList.add('waiting');
@@ -1473,33 +1438,22 @@ function pushRow(tb, w){
   const tr=document.createElement('tr');
   tr.appendChild(td(w.symbol));
   tr.appendChild(td(w.interval));
-  tr.appendChild(tdInt(w.leverage));         // целое число
+  tr.appendChild(td(w.source||''));
+  tr.appendChild(td(w.leverage));
   tr.appendChild(td(w.mode||'-'));
   tr.appendChild(td(w.midFilter?'ON':'OFF'));
-  const stateCell = document.createElement('td'); stateCell.appendChild(stateBadge(w.botState)); tr.appendChild(stateCell);
-
-  // Balance
-  tr.appendChild(tdMoney((w.balance!=null)?w.balance:w.availableUSDT));
-
-  // Position ($) — если есть lastPrice и netPos число
-  let posCell = document.createElement('td');
-  if(typeof w.netPos==='number' && typeof w.lastPrice==='number' && isFinite(w.lastPrice)){
-    const notional = w.netPos * w.lastPrice;
-    posCell.textContent = notional.toFixed(2);
-  } else {
-    // для External строк оставляем исходный текст
-    posCell.textContent = (w.netPos!=null)? String(w.netPos) : '';
-  }
-  tr.appendChild(posCell);
-
+  tr.appendChild(td(sigText(w.lastSignal)));
+  const stateCell = document.createElement('td');
+  stateCell.appendChild(stateBadge(w.botState));
+  tr.appendChild(stateCell);
+  tr.appendChild(td(w.availableUSDT));
+  tr.appendChild(td(w.netPos));
   tr.appendChild(td(w.entryPx));
   tr.appendChild(td(w.ema50));
   tr.appendChild(td(w.ema100));
   tr.appendChild(td(w.ema200));
-
-  tr.appendChild(pnlCell(w.uPnL, w.uPnL_pct));
-
-  tr.appendChild(td(w.lastAction||'')); 
+  tr.appendChild(pnlCell(w.pnlToday));
+  tr.appendChild(td(w.lastAction||''));
   tr.appendChild(td(w.lastError||''));
   tb.appendChild(tr);
 }
@@ -1508,18 +1462,26 @@ async function refresh(){
   const flag=document.getElementById('flag');
   flag.textContent = st.running?'Running':'Stopped';
   flag.className = 'pill ' + (st.running?'on':'off');
-
-  const tb=document.getElementById('tbody'); tb.innerHTML='';
+  const tb=document.getElementById('tbody');
+  tb.innerHTML='';
   (st.workers||[]).forEach(w=> pushRow(tb, w));
   (st.external||[]).forEach(w=> pushRow(tb, w));
 }
-async function loop(){ try{ await refresh(); const st=await get('/api/status'); setTimeout(loop, st.running?1200:3000);}catch(e){ console.error(e); setTimeout(loop,3000);} }
+async function loop(){
+  try{
+    await refresh();
+    const st=await get('/api/status');
+    setTimeout(loop, st.running?1200:3000);
+  }catch(e){
+    console.error(e);
+    setTimeout(loop,3000);
+  }
+}
 window.addEventListener('load', loop);
 window.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ document.getElementById('btnStart').click(); } });
 </script>
 </body></html>
 """
-
 HTML = HTML_TEMPLATE.replace("%%TF_OPTIONS%%", TF_OPTIONS)
 
 # ---------- FastAPI ----------
